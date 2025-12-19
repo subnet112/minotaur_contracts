@@ -496,9 +496,6 @@ The Foundry book provides detailed configuration options: <https://book.getfound
 ---
 
 ## Documentation
-
-- **`docs/simulation-security-analysis.md`** – Comprehensive security analysis of the simulator
-- **`docs/blocknumber-security-analysis.md`** – Analysis of blockNumber validation gap
 - **`docs/expiry-and-nonce-mechanisms.md`** – Detailed explanation of deadline and nonce systems
 - **`docs/signature-generation-guide.md`** – Guide for generating EIP-712 signatures on frontend
 - **`docs/settlement-integration-guide.md`** – Integration guide for Settlement contract
