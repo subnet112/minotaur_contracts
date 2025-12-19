@@ -1,0 +1,12 @@
+# Results directory
+results/
+*.out
+
+# Temporary files
+tmp/
+.env
+cache/
+
+
+# Foundry
+lib/

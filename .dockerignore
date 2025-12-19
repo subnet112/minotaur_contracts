@@ -1,0 +1,12 @@
+out/
+cache/
+tmp/
+.git/
+.env
+*.md
+docs/
+configs/
+test/
+
+# Sandbox scripts - development only, not needed for production
+script/sandbox/
