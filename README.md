@@ -441,7 +441,29 @@ Test coverage includes:
 
 ### Deployment
 
-Deploy a new settlement contract:
+For detailed deployment instructions, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+**Quick Start:**
+
+1. Copy the environment template:
+   ```bash
+   cp env.template .env
+   # Edit .env with your configuration
+   ```
+
+2. Deploy to Ethereum Mainnet:
+   ```bash
+   make deploy-ethereum
+   # Or: ./scripts/deploy-ethereum.sh
+   ```
+
+3. Deploy to Base Mainnet:
+   ```bash
+   make deploy-base
+   # Or: ./scripts/deploy-base.sh
+   ```
+
+**Manual Deployment:**
 
 ```bash
 forge script script/SettlementDeploy.s.sol:SettlementDeploy \
@@ -452,6 +474,8 @@ forge script script/SettlementDeploy.s.sol:SettlementDeploy \
 **Environment variables**:
 - `PRIVATE_KEY` – Deployer key (hex string without the `0x` prefix)
 - `SETTLEMENT_OWNER` – Optional owner address; defaults to the deployer when unset
+- `MAINNET_RPC_URL` – Ethereum Mainnet RPC endpoint
+- `BASE_RPC_URL` – Base Mainnet RPC endpoint
 
 ### Post-Deployment Configuration
 
@@ -497,6 +521,7 @@ The Foundry book provides detailed configuration options: <https://book.getfound
 
 ## Documentation
 
+- **`docs/DEPLOYMENT.md`** – Complete guide for deploying contracts to Ethereum and Base
 - **`docs/simulation-security-analysis.md`** – Comprehensive security analysis of the simulator
 - **`docs/blocknumber-security-analysis.md`** – Analysis of blockNumber validation gap
 - **`docs/expiry-and-nonce-mechanisms.md`** – Detailed explanation of deadline and nonce systems

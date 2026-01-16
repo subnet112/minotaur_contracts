@@ -24,6 +24,8 @@ remappings = [
 [profile.default.rpc_endpoints]
 mainnet = "${MAINNET_RPC_URL}"
 sepolia = "${SEPOLIA_RPC_URL}"
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 
 # Faster compilation profile for scripts (lower optimizer runs for speed)
 [profile.script]

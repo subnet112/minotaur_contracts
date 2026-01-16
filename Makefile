@@ -114,4 +114,60 @@ clean: ## Remove the container
 logs: ## Show container logs
 	@docker logs $(CONTAINER_NAME)
 
+# =============================================================================
+# Deployment Targets
+# =============================================================================
+
+.PHONY: deploy-ethereum deploy-base configure-ethereum configure-base
+
+deploy-ethereum: ## Deploy Settlement contract to Ethereum Mainnet
+	@if [ ! -f .env ]; then \
+		echo "⚠️  Warning: .env file not found. Using environment variables."; \
+	fi
+	@chmod +x scripts/deploy-ethereum.sh
+	@./scripts/deploy-ethereum.sh
+
+deploy-base: ## Deploy Settlement contract to Base Mainnet
+	@if [ ! -f .env ]; then \
+		echo "⚠️  Warning: .env file not found. Using environment variables."; \
+	fi
+	@chmod +x scripts/deploy-base.sh
+	@./scripts/deploy-base.sh
+
+configure-ethereum: ## Configure Settlement contract on Ethereum Mainnet
+	@if [ -z "$(SETTLEMENT_ADDRESS)" ]; then \
+		echo "❌ Error: SETTLEMENT_ADDRESS is required"; \
+		echo "Usage: make configure-ethereum SETTLEMENT_ADDRESS=0x..."; \
+		exit 1; \
+	fi
+	@chmod +x scripts/configure-ethereum.sh
+	@./scripts/configure-ethereum.sh
+
+configure-ethereum-dex: ## Configure Ethereum Settlement with DEX router allowlist
+	@if [ -z "$(SETTLEMENT_ADDRESS)" ]; then \
+		echo "❌ Error: SETTLEMENT_ADDRESS is required"; \
+		echo "Usage: make configure-ethereum-dex SETTLEMENT_ADDRESS=0x..."; \
+		exit 1; \
+	fi
+	@chmod +x scripts/configure-ethereum-dex-routers.sh
+	@./scripts/configure-ethereum-dex-routers.sh
+
+configure-base: ## Configure Settlement contract on Base Mainnet
+	@if [ -z "$(SETTLEMENT_ADDRESS)" ]; then \
+		echo "❌ Error: SETTLEMENT_ADDRESS is required"; \
+		echo "Usage: make configure-base SETTLEMENT_ADDRESS=0x..."; \
+		exit 1; \
+	fi
+	@chmod +x scripts/configure-base.sh
+	@./scripts/configure-base.sh
+
+configure-base-dex: ## Configure Base Settlement with DEX router allowlist
+	@if [ -z "$(SETTLEMENT_ADDRESS)" ]; then \
+		echo "❌ Error: SETTLEMENT_ADDRESS is required"; \
+		echo "Usage: make configure-base-dex SETTLEMENT_ADDRESS=0x..."; \
+		exit 1; \
+	fi
+	@chmod +x scripts/configure-base-dex-routers.sh
+	@./scripts/configure-base-dex-routers.sh
+
 
