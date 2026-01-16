@@ -1,12 +1,41 @@
-# Results directory
-results/
-*.out
+# Foundry build artifacts
+out/
+cache/
+
+# Foundry dependencies (managed by forge)
+lib/
+
+# Broadcast logs (deployment transactions - may contain sensitive data)
+broadcast/
+
+# Environment files (secrets)
+.env
+.env.*
+!.env.example
+!env.template
 
 # Temporary files
 tmp/
-.env
-cache/
+*.tmp
 
+# Results/output files
+results/
+*.out
+*.log
 
-# Foundry
-lib/
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node (if using any JS tooling)
+node_modules/
+
+# Coverage reports
+lcov.info
+coverage/
