@@ -1388,6 +1388,308 @@ contract SettlementTest is Test {
         new Settlement(address(0));
     }
 
+    /// @notice Pausing blocks new order executions
+    function testPauseBlocksExecuteOrder() public {
+        uint256 amountIn = 50 ether;
+        uint256 amountOut = 45 ether;
+        MockInteractionTarget interactionTarget = _deployInteractionTarget(permitTokenIn, tokenOut);
+        tokenOut.mint(address(interactionTarget), 1_000 ether);
+
+        Settlement.ExecutionPlan memory plan =
+            _buildPlan(address(permitTokenIn), address(interactionTarget), amountIn, amountOut);
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, amountIn, amountOut);
+
+        uint256 permitDeadline = block.timestamp + 1 hours;
+        intent.permit = Settlement.PermitData({
+            permitType: Settlement.PermitType.EIP2612,
+            permitCall: _buildEIP2612PermitCall(permitTokenIn, amountIn, permitDeadline),
+            amount: amountIn,
+            deadline: permitDeadline
+        });
+        intent.userSignature = _signIntent(intent);
+
+        // Pause the contract
+        settlement.pause();
+
+        // Execution should fail with EnforcedPause error
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Unpausing allows order executions to resume
+    function testUnpauseAllowsExecuteOrder() public {
+        uint256 amountIn = 50 ether;
+        uint256 amountOut = 45 ether;
+        MockInteractionTarget interactionTarget = _deployInteractionTarget(permitTokenIn, tokenOut);
+        tokenOut.mint(address(interactionTarget), 1_000 ether);
+
+        Settlement.ExecutionPlan memory plan =
+            _buildPlan(address(permitTokenIn), address(interactionTarget), amountIn, amountOut);
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, amountIn, amountOut);
+
+        uint256 permitDeadline = block.timestamp + 1 hours;
+        intent.permit = Settlement.PermitData({
+            permitType: Settlement.PermitType.EIP2612,
+            permitCall: _buildEIP2612PermitCall(permitTokenIn, amountIn, permitDeadline),
+            amount: amountIn,
+            deadline: permitDeadline
+        });
+        intent.userSignature = _signIntent(intent);
+
+        // Pause and then unpause
+        settlement.pause();
+        settlement.unpause();
+
+        // Execution should succeed now
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+
+        assertTrue(settlement.isNonceUsed(user, intent.nonce), "order should have executed");
+    }
+
+    /// @notice Only owner can pause the contract
+    function testPauseOnlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
+        vm.prank(user);
+        settlement.pause();
+    }
+
+    /// @notice Only owner can unpause the contract
+    function testUnpauseOnlyOwner() public {
+        settlement.pause();
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
+        vm.prank(user);
+        settlement.unpause();
+    }
+
+    /// @notice Pause emits ContractPaused event
+    function testPauseEmitsEvent() public {
+        vm.expectEmit(true, false, false, false);
+        emit Settlement.ContractPaused(address(this));
+        settlement.pause();
+    }
+
+    /// @notice Unpause emits ContractUnpaused event
+    function testUnpauseEmitsEvent() public {
+        settlement.pause();
+
+        vm.expectEmit(true, false, false, false);
+        emit Settlement.ContractUnpaused(address(this));
+        settlement.unpause();
+    }
+
+    /// @notice Cannot pause when already paused
+    function testCannotPauseWhenPaused() public {
+        settlement.pause();
+
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        settlement.pause();
+    }
+
+    /// @notice Cannot unpause when not paused
+    function testCannotUnpauseWhenNotPaused() public {
+        vm.expectRevert(abi.encodeWithSignature("ExpectedPause()"));
+        settlement.unpause();
+    }
+
+    /// @notice Interactions targeting Settlement contract itself are blocked
+    function testBlocksInteractionTargetingSelf() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(settlement),
+            value: 0,
+            callData: abi.encodeWithSelector(Settlement.pause.selector)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(abi.encodeWithSelector(Settlement.InvalidInteractionTarget.selector, address(settlement)));
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token interactions with non-approve selectors are blocked
+    function testBlocksTokenTransferInteraction() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: abi.encodeWithSelector(IERC20.transfer.selector, address(0xBAD), 100 ether)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(Settlement.InvalidTokenInteraction.selector, address(permitTokenIn), IERC20.transfer.selector)
+        );
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token interactions with transferFrom are blocked
+    function testBlocksTokenTransferFromInteraction() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: abi.encodeWithSelector(IERC20.transferFrom.selector, user, address(0xBAD), 100 ether)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(Settlement.InvalidTokenInteraction.selector, address(permitTokenIn), IERC20.transferFrom.selector)
+        );
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token approve to non-allowlisted spender is blocked when allowlist is enabled
+    function testBlocksApproveToNonAllowlistedSpender() public {
+        settlement.setAllowlistEnabled(true);
+
+        address maliciousSpender = address(0xBAD);
+
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: abi.encodeWithSelector(IERC20.approve.selector, maliciousSpender, 100 ether)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(abi.encodeWithSelector(Settlement.ApproveToNonAllowlistedSpender.selector, maliciousSpender));
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token approve to allowlisted spender succeeds
+    function testAllowsApproveToAllowlistedSpender() public {
+        settlement.setAllowlistEnabled(true);
+
+        MockNoopTarget allowedRouter = new MockNoopTarget();
+        settlement.setInteractionTarget(address(allowedRouter), true);
+
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: abi.encodeWithSelector(IERC20.approve.selector, address(allowedRouter), 100 ether)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+
+        // Verify approval was set
+        assertEq(permitTokenIn.allowance(address(settlement), address(allowedRouter)), 100 ether);
+    }
+
+    /// @notice TokenOut interactions with transfer are blocked
+    function testBlocksTokenOutTransferInteraction() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(tokenOut),
+            value: 0,
+            callData: abi.encodeWithSelector(IERC20.transfer.selector, address(0xBAD), 100 ether)
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = new Settlement.Interaction[](0);
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = interactions;
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(Settlement.InvalidTokenInteraction.selector, address(tokenOut), IERC20.transfer.selector)
+        );
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token interaction with short calldata is blocked
+    function testBlocksTokenInteractionWithShortCalldata() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: hex"12" // Only 1 byte, less than 4 bytes for selector
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(abi.encodeWithSelector(Settlement.InvalidTokenInteraction.selector, address(permitTokenIn), bytes4(0)));
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
+    /// @notice Token approve with incomplete calldata is blocked
+    function testBlocksApproveWithIncompleteCalldata() public {
+        Settlement.Interaction[] memory interactions = new Settlement.Interaction[](1);
+        // approve selector but only 32 bytes of data (missing the uint256 amount)
+        interactions[0] = Settlement.Interaction({
+            target: address(permitTokenIn),
+            value: 0,
+            callData: abi.encodePacked(IERC20.approve.selector, bytes32(uint256(uint160(address(0x123)))))
+        });
+
+        Settlement.ExecutionPlan memory plan;
+        plan.preInteractions = interactions;
+        plan.interactions = new Settlement.Interaction[](0);
+        plan.postInteractions = new Settlement.Interaction[](0);
+
+        Settlement.OrderIntent memory intent = _buildBaseIntent(plan, permitTokenIn, tokenOut, 0, 0);
+        intent.userSignature = _signIntent(intent);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(Settlement.InvalidTokenInteraction.selector, address(permitTokenIn), IERC20.approve.selector)
+        );
+        vm.prank(relayer);
+        settlement.executeOrder(intent, plan);
+    }
+
     /// @notice Self-call protection prevents direct calls to internal execute function
     function testSelfCallProtection() public {
         Settlement.ExecutionPlan memory plan;

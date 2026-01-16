@@ -6,6 +6,7 @@ import {IERC20Permit} from "openzeppelin-contracts/token/ERC20/extensions/IERC20
 import {SafeERC20} from "openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "openzeppelin-contracts/access/Ownable.sol";
 import {Ownable2Step} from "openzeppelin-contracts/access/Ownable2Step.sol";
+import {Pausable} from "openzeppelin-contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "openzeppelin-contracts/utils/ReentrancyGuard.sol";
 import {EIP712} from "openzeppelin-contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "openzeppelin-contracts/utils/cryptography/ECDSA.sol";
@@ -17,7 +18,7 @@ import {ITransferWithAuthorization} from "./interfaces/ITransferWithAuthorizatio
 /// @title Single-order settlement contract for the Mino aggregator
 /// @notice Verifies user intents, executes solver-provided interaction plans, and settles swaps atomically
 /// @dev Inspired by CoW Protocol's GPv2Settlement but limited to one order per transaction
-contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
+contract Settlement is EIP712, ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
     /// @notice Permit types supported by the settlement contract
@@ -153,6 +154,10 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
     event TokenSwept(IERC20 indexed token, address indexed to, uint256 amount);
     /// @notice Emitted when fee parameters are updated by the owner
     event FeeParametersUpdated(address indexed recipient, uint256 feeBps);
+    /// @notice Emitted when the contract is paused
+    event ContractPaused(address indexed by);
+    /// @notice Emitted when the contract is unpaused
+    event ContractUnpaused(address indexed by);
 
     /// @notice Thrown when an order exceeds its deadline
     error OrderExpired();
@@ -198,6 +203,10 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
     error InsufficientCallValue(uint256 available, uint256 requested);
     /// @notice Thrown when an interaction target is invalid or not allowed
     error InvalidInteractionTarget(address target);
+    /// @notice Thrown when an interaction attempts to call a disallowed function on a token
+    error InvalidTokenInteraction(address token, bytes4 selector);
+    /// @notice Thrown when an approve interaction targets a non-allowlisted spender
+    error ApproveToNonAllowlistedSpender(address spender);
     /// @notice Thrown when an interaction call reverts and bubbles the return data
     error InteractionCallFailed(address target, bytes reason);
     /// @notice Thrown when an internal call can only be made via the contract itself
@@ -221,6 +230,7 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
         external
         payable
         nonReentrant
+        whenNotPaused
         returns (uint256 amountOut)
     {
         if (relayerRestrictionEnabled && !trustedRelayers[msg.sender]) {
@@ -344,6 +354,20 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
         emit FeeParametersUpdated(recipient, feeBps);
     }
 
+    /// @notice Pauses all settlement operations
+    /// @dev Can only be called by the owner; prevents new orders from being executed
+    function pause() external onlyOwner {
+        _pause();
+        emit ContractPaused(msg.sender);
+    }
+
+    /// @notice Resumes settlement operations after being paused
+    /// @dev Can only be called by the owner
+    function unpause() external onlyOwner {
+        _unpause();
+        emit ContractUnpaused(msg.sender);
+    }
+
     /// @notice Sweeps stray native ETH to an address controlled by the owner
     /// @param to Recipient of the swept ETH
     /// @param amount Amount of ETH to transfer
@@ -442,15 +466,35 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
         uint256 length = interactions.length;
         for (uint256 i = 0; i < length;) {
             Interaction calldata interaction = interactions[i];
+
+            // Block zero address
             if (interaction.target == address(0)) {
                 revert InvalidInteractionTarget(interaction.target);
             }
-            if (allowlistEnabled && !interactionTargetAllowed[interaction.target]) {
+
+            // Block calls to the Settlement contract itself
+            if (interaction.target == address(this)) {
                 revert InvalidInteractionTarget(interaction.target);
             }
+
+            // For tokenIn and tokenOut: only allow approve() to allowlisted spenders
+            // Token interactions have their own validation and skip the general allowlist check
+            bool isTokenInteraction = interaction.target == address(intent.tokenIn)
+                || interaction.target == address(intent.tokenOut);
+
+            if (isTokenInteraction) {
+                _validateTokenInteraction(interaction);
+            } else {
+                // Standard allowlist check for non-token targets
+                if (allowlistEnabled && !interactionTargetAllowed[interaction.target]) {
+                    revert InvalidInteractionTarget(interaction.target);
+                }
+            }
+
             if (interaction.value > remainingCallValue) {
                 revert InsufficientCallValue(remainingCallValue, interaction.value);
             }
+
             (bool success, bytes memory returndata) =
                 interaction.target.call{value: interaction.value}(interaction.callData);
             if (!success) {
@@ -464,6 +508,36 @@ contract Settlement is EIP712, ReentrancyGuard, Ownable2Step {
             }
         }
         return remainingCallValue;
+    }
+
+    /// @dev Validates that token interactions are limited to approve() with allowlisted spenders
+    /// @param interaction The interaction to validate
+    function _validateTokenInteraction(Interaction calldata interaction) private view {
+        // Require at least 4 bytes for function selector
+        if (interaction.callData.length < 4) {
+            revert InvalidTokenInteraction(interaction.target, bytes4(0));
+        }
+
+        bytes4 selector = bytes4(interaction.callData[:4]);
+
+        // Only allow approve(address,uint256) - selector 0x095ea7b3
+        if (selector != IERC20.approve.selector) {
+            revert InvalidTokenInteraction(interaction.target, selector);
+        }
+
+        // Require full calldata length: 4 (selector) + 32 (address) + 32 (uint256) = 68 bytes
+        if (interaction.callData.length < 68) {
+            revert InvalidTokenInteraction(interaction.target, selector);
+        }
+
+        // Decode the spender address from calldata (skip 4-byte selector)
+        (address spender,) = abi.decode(interaction.callData[4:], (address, uint256));
+
+        // Spender must be an allowlisted interaction target (when allowlist is enabled)
+        // This ensures approve() can only grant allowance to legitimate routers
+        if (allowlistEnabled && !interactionTargetAllowed[spender]) {
+            revert ApproveToNonAllowlistedSpender(spender);
+        }
     }
 
     /// @dev Applies the permit associated with an intent when required
