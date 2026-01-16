@@ -101,30 +101,47 @@ contract ExecutionPlanSimulator is Script, StdCheats {
         string memory forkUrl = _resolveForkUrl();
         uint256 forkBlock = _readUintOrDefault(json, "$.quoteDetails.settlement.executionPlan.blockNumber", 0);
         
-        // Warn about stale blockNumbers (security concern: solver could use old blocks with better liquidity)
+        // blockNumber handling:
+        // - If a blockNumber is provided, we fork latest briefly to compute staleness, then fork at the requested block.
+        // - If the blockNumber is stale, we treat it as an error (security concern: solver could use old blocks with better liquidity).
         if (forkBlock != 0) {
-            // Get current block from RPC to check age
-            vm.createSelectFork(forkUrl); // First fork to get current block
+            vm.createSelectFork(forkUrl); // fork latest to get current block
             uint256 currentBlock = block.number;
-            vm.createSelectFork(forkUrl, forkBlock); // Then fork to specified block
-            
+
             if (currentBlock > forkBlock) {
                 uint256 blockAge = currentBlock - forkBlock;
                 uint256 MAX_BLOCK_AGE = 256; // ~1 hour on Ethereum mainnet (~12s per block)
-                
+
                 if (blockAge > MAX_BLOCK_AGE) {
                     console2.log("\n[WARNING] BlockNumber is stale!");
                     console2.log("  - Fork block:", forkBlock);
                     console2.log("  - Current block:", currentBlock);
                     console2.log("  - Block age:", blockAge, "blocks");
-                    console2.log("  - Max recommended:", MAX_BLOCK_AGE, "blocks (~1 hour on mainnet)");
+                    console2.log("  - Max allowed:", MAX_BLOCK_AGE, "blocks (~1 hour on mainnet)");
                     console2.log("  - SECURITY RISK: Solver may be using old block with better liquidity/prices");
-                    console2.log("  - Order may fail on-chain or execute at worse terms than simulated");
                     console2.log("  - Validators should reject orders with blockNumber older than 256 blocks\n");
+
+                    // Emit a structured JSON summary before failing, so callers can reliably parse the reason.
+                    string memory root = "result";
+                    vm.serializeBool(root, "success", false);
+                    vm.serializeString(root, "quoteId", _readStringOrDefault(json, "$.quoteDetails.quoteId", "sim-quote"));
+                    vm.serializeUint(root, "forkBlock", forkBlock);
+                    vm.serializeUint(root, "currentBlock", currentBlock);
+                    vm.serializeUint(root, "blockAge", blockAge);
+                    string memory staleJson = vm.serializeString(
+                        root,
+                        "errorMessage",
+                        "Stale blockNumber: latestBlock - blockNumber > 256. Provide a more recent blockNumber."
+                    );
+                    console2.log("\n=== Simulation Summary ===");
+                    console2.log(staleJson);
+                    revert("Stale blockNumber");
                 }
             }
+
+            vm.createSelectFork(forkUrl, forkBlock); // fork at requested block for the actual simulation
         } else {
-            vm.createSelectFork(forkUrl);
+            vm.createSelectFork(forkUrl); // fork latest
         }
 
         address owner = vm.addr(OWNER_PRIVATE_KEY);
