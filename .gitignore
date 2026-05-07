@@ -1,0 +1,20 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+
+# Test coverage
+lcov.info
+coverage/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Local env
+.env
+.env.local
