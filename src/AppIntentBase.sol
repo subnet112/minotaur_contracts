@@ -20,6 +20,24 @@ interface IWETH {
 ///         ephemeral proxy execution, replay protection, intent registration,
 ///         and cross-chain escrow for multi-leg intents.
 ///         All App contracts inherit from this.
+///
+///         Fee enforcement:
+///         The base contract makes protocol-fee settlement NON-OVERRIDABLE.
+///         Apps customize only the fee AMOUNT via `_calculateProtocolFee`,
+///         which the base then CLAMPS to [minPlatformFeeWei, maxPlatformFeeWei]
+///         before settling. The settlement path itself (`_settleProtocolFeePre`
+///         / `_verifyFeeSettlementPost`) is `private` and cannot be skipped.
+///
+///         Two payment patterns are supported:
+///         - FeeMode.USER: fee is pulled directly from the user via
+///           safeTransferFrom(user, platformFeeCollector, fee). Suitable when
+///           the user holds the wrapped native token and is Bittensor-aware.
+///         - FeeMode.APP: the base snapshots `platformFeeCollector` balance,
+///           runs `_handleIntent`, and requires the collector balance to have
+///           grown by at least the owed fee. The app is responsible for
+///           sourcing the payment during its intent logic (typically from
+///           swap surplus or its own paymaster). Suitable for consumer-facing
+///           apps whose users do not hold the wrapped native token.
 abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -36,9 +54,20 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
     // ── Platform fee state ──────────────────────────────────────────────
 
+    /// @notice Who pays the protocol fee on each order.
+    enum FeeMode {
+        USER,   // Pulled directly from the user (user signed the fee amount).
+        APP     // Delivered by the app to the collector during _handleIntent.
+    }
+
     IERC20 public immutable wrappedNativeToken;   // WETH on Ethereum/Base, WTAO on BT EVM
-    address public platformFeeCollector;           // treasury or relayer address
-    uint256 public maxPlatformFeeWei;             // safety cap to prevent griefing
+    address public platformFeeCollector;          // protocol treasury / FeeSplitter
+    uint256 public maxPlatformFeeWei;             // safety cap (protects users from runaway orders)
+    uint256 public minPlatformFeeWei;             // protocol floor (protects subnet from fee=0 orders)
+    FeeMode public feeMode;                       // who pays — USER or APP
+    address public appPaymaster;                  // when feeMode == APP, recommended source of funds
+                                                  // (informational — the base only checks the collector
+                                                  //  balance delta, not where the funds came from)
 
     mapping(address => uint256) public nonces;
     mapping(bytes32 => bool) public executedOrders;        // one-shot replay
@@ -66,6 +95,12 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         uint256 amount
     );
 
+    event FeeModeUpdated(FeeMode mode);
+    event AppPaymasterUpdated(address indexed paymaster);
+    event MinPlatformFeeUpdated(uint256 minFeeWei);
+    event MaxPlatformFeeUpdated(uint256 maxFeeWei);
+    event PlatformFeeCollectorUpdated(address indexed collector);
+
     event EscrowDeposited(
         bytes32 indexed orderId, uint256 legIndex,
         address token, uint256 amount, address user, uint256 deadline
@@ -75,6 +110,20 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
     // ── Constructor ──────────────────────────────────────────────────────
 
+    /// @notice Initialize the platform contract.
+    /// @param _relayer Trusted relayer address (submits transactions, runs admin).
+    /// @param _validatorRegistry Address of the ValidatorRegistry.
+    /// @param _quorumBps Required quorum in BPS (e.g. 8000 = 80%).
+    /// @param _scoreThreshold Minimum on-chain plan score in BPS (>= 5000).
+    /// @param _wrappedNativeToken WETH on EVM chains, WTAO on Bittensor EVM.
+    /// @param _platformFeeCollector Where protocol fees flow (treasury / FeeSplitter).
+    /// @param _minPlatformFeeWei Floor on protocol fee — protects against fee=0 orders.
+    /// @param _maxPlatformFeeWei Cap on protocol fee — protects against runaway charges.
+    /// @param _feeMode FeeMode.USER (pull from user) or FeeMode.APP (verify collector balance grew).
+    /// @param _appPaymaster Optional informational pointer to the app's funding source
+    ///        when _feeMode == APP. Apps may use this for off-chain monitoring; the contract
+    ///        does not enforce funds come from this exact address — only that the collector
+    ///        balance increased by at least the owed amount during _handleIntent.
     constructor(
         address _relayer,
         address _validatorRegistry,
@@ -82,21 +131,28 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         uint256 _scoreThreshold,
         address _wrappedNativeToken,
         address _platformFeeCollector,
-        uint256 _maxPlatformFeeWei
+        uint256 _minPlatformFeeWei,
+        uint256 _maxPlatformFeeWei,
+        FeeMode _feeMode,
+        address _appPaymaster
     ) {
         require(_relayer != address(0), "Invalid relayer");
         require(_validatorRegistry != address(0), "Invalid registry");
         require(_quorumBps > 0 && _quorumBps <= 10000, "Invalid quorum");
+        require(_minPlatformFeeWei <= _maxPlatformFeeWei, "Min fee exceeds max");
 
         relayer = _relayer;
         validatorRegistry = _validatorRegistry;
         quorumBps = _quorumBps;
         scoreThreshold = _scoreThreshold >= 5000 ? _scoreThreshold : 5000;
 
-        // Platform fee setup (zero address = fees disabled)
+        // Platform fee setup (zero collector = fees effectively disabled if both floors zero)
         wrappedNativeToken = IERC20(_wrappedNativeToken);
         platformFeeCollector = _platformFeeCollector;
+        minPlatformFeeWei = _minPlatformFeeWei;
         maxPlatformFeeWei = _maxPlatformFeeWei;
+        feeMode = _feeMode;
+        appPaymaster = _appPaymaster;
 
         DOMAIN_SEPARATOR = keccak256(abi.encode(
             keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -171,8 +227,8 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         );
         require(validSigs >= quorumRequired, "Insufficient quorum");
 
-        // 7. Collect platform fee (WETH/WTAO) from user
-        _collectPlatformFee(order.orderId, order.submittedBy, order.intentParams);
+        // 7. Protocol fee — pre-handle settlement (pulls or snapshots, never skipped).
+        (uint256 feeOwed, uint256 collectorBefore) = _settleProtocolFeePre(order);
 
         // 8-9. Execute plan and check intent via dispatch
         (uint256 score, bool valid) = _handleIntent(order, plan);
@@ -180,6 +236,9 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
         // 10. Enforce on-chain score threshold
         require(score >= scoreThreshold, "Score below threshold");
+
+        // 10b. Protocol fee — post-handle verification (APP mode only).
+        _verifyFeeSettlementPost(order.orderId, order.submittedBy, feeOwed, collectorBefore);
 
         // 11. Update state (only increment nonce when not using sentinel)
         if (order.nonce != type(uint256).max) {
@@ -296,13 +355,16 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         );
         require(validSigs >= quorumRequired, "Insufficient quorum");
 
-        // 6. Collect platform fee (WETH/WTAO) from user
-        _collectPlatformFee(order.orderId, order.submittedBy, order.intentParams);
+        // 6. Protocol fee — pre-handle settlement.
+        (uint256 feeOwed, uint256 collectorBefore) = _settleProtocolFeePre(order);
 
         // 7. Execute plan and check intent
         (uint256 score, bool valid) = _handleIntent(order, plan);
         require(valid, "Intent invariant check failed");
         require(score >= scoreThreshold, "Score below threshold");
+
+        // 7b. Protocol fee — post-handle verification (APP mode only).
+        _verifyFeeSettlementPost(order.orderId, order.submittedBy, feeOwed, collectorBefore);
 
         // 8. Mark this leg as executed
         legExecuted[order.orderId][legIndex] = true;
@@ -541,14 +603,19 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     /// @dev Runs _handleIntent (execute + check). No signature/nonce/replay checks.
     ///      Called within simulator snapshot (reverted after).
     ///      Restricted to relayer to prevent unauthorized execution.
+    ///
+    ///      Fee accounting matches executeIntent: pre-handle settle, post-handle
+    ///      verify. The fork is reverted after simulation, so no real tokens move
+    ///      but the validator can confirm the fee path WORKS for this order.
     function scoreIntent(
         IntentOrder calldata order,
         ExecutionPlan calldata plan
     ) external virtual onlyRelayer nonReentrant returns (uint256 score, bool valid) {
-        // Collect platform fee during simulation so Anvil fork matches real execution.
-        // The fork is reverted after simulation, so no real tokens move.
-        _collectPlatformFee(order.orderId, order.submittedBy, order.intentParams);
-        return _handleIntent(order, plan);
+        (uint256 feeOwed, uint256 collectorBefore) = _settleProtocolFeePre(order);
+        (score, valid) = _handleIntent(order, plan);
+        if (valid) {
+            _verifyFeeSettlementPost(order.orderId, order.submittedBy, feeOwed, collectorBefore);
+        }
     }
 
     // ── Admin (relayer only) ─────────────────────────────────────────────
@@ -578,45 +645,123 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     function setPlatformFeeCollector(address _collector) external onlyRelayer {
         require(_collector != address(0), "Invalid collector");
         platformFeeCollector = _collector;
+        emit PlatformFeeCollectorUpdated(_collector);
     }
 
     function setMaxPlatformFeeWei(uint256 _maxFee) external onlyRelayer {
+        require(_maxFee >= minPlatformFeeWei, "Max below min");
         maxPlatformFeeWei = _maxFee;
+        emit MaxPlatformFeeUpdated(_maxFee);
+    }
+
+    function setMinPlatformFeeWei(uint256 _minFee) external onlyRelayer {
+        require(_minFee <= maxPlatformFeeWei, "Min above max");
+        minPlatformFeeWei = _minFee;
+        emit MinPlatformFeeUpdated(_minFee);
+    }
+
+    function setFeeMode(FeeMode _mode) external onlyRelayer {
+        feeMode = _mode;
+        emit FeeModeUpdated(_mode);
+    }
+
+    function setAppPaymaster(address _paymaster) external onlyRelayer {
+        appPaymaster = _paymaster;
+        emit AppPaymasterUpdated(_paymaster);
     }
 
     // ── Platform fee internals ──────────────────────────────────────────
 
-    /// @notice Decode the platform fee from the last 32 bytes of intentParams.
-    ///         All apps append platformFeeWei as the final uint256 field.
+    /// @notice Default fee decoder — reads the last 32 bytes of intentParams.
+    ///         Apps whose intentParams encoding does NOT end with
+    ///         `uint256 platformFeeWei` must override `_calculateProtocolFee`
+    ///         instead of relying on this helper.
     function _decodePlatformFee(bytes calldata intentParams) internal pure returns (uint256) {
         if (intentParams.length < 32) return 0;
         return abi.decode(intentParams[intentParams.length - 32:], (uint256));
     }
 
-    /// @notice Collect platform fee in wrapped native token (WETH/WTAO) from the user.
-    ///         Called by executeIntent/executeLeg before app logic runs.
-    /// @dev Skipped when msg.value > 0 (native input path) — user has no WETH
-    ///      to pull from. Platform fees for native swaps are out of scope for
-    ///      the initial release and can be added by wrapping extra msg.value.
-    ///
-    ///      This is `virtual` so apps can override the default "pull WETH
-    ///      up-front" behaviour. DexAggregatorApp overrides it to a no-op
-    ///      because it deducts the fee from the swap output post-execution,
-    ///      which avoids requiring users to hold/approve WETH before swapping
-    ///      INTO WETH.
-    function _collectPlatformFee(
-        bytes32 orderId,
-        address user,
-        bytes calldata intentParams
-    ) internal virtual {
-        if (msg.value > 0) return;  // Skip for native input swaps
-        uint256 feeWei = _decodePlatformFee(intentParams);
-        if (feeWei == 0) return;
+    /// @notice Compute the protocol fee for this order, in wrappedNativeToken wei.
+    /// @dev Apps override this to customize the AMOUNT — e.g. to decode a different
+    ///      position in intentParams, or compute from plan complexity. The returned
+    ///      value is then clamped to [minPlatformFeeWei, maxPlatformFeeWei] by the
+    ///      base, so apps CANNOT bypass the floor or exceed the cap.
+    ///      Default implementation reads the last 32 bytes of intentParams.
+    function _calculateProtocolFee(
+        IntentOrder calldata order
+    ) internal view virtual returns (uint256) {
+        return _decodePlatformFee(order.intentParams);
+    }
+
+    /// @dev Strictly validate that the candidate fee lies in the configured
+    ///      [min, max] range. Reverts on out-of-bounds so the user's signed
+    ///      order is honoured exactly — never silently re-priced.
+    ///      App overrides of `_calculateProtocolFee` and `_swap`-style flows
+    ///      call this BEFORE attempting the actual transfer, so a mismatch
+    ///      between the off-chain price quote and the on-chain configuration
+    ///      surfaces as a clear revert rather than an unexpected charge.
+    function _clampFee(uint256 feeWei) internal view returns (uint256) {
         require(feeWei <= maxPlatformFeeWei, "Fee exceeds cap");
+        require(feeWei >= minPlatformFeeWei, "Fee below floor");
+        return feeWei;
+    }
+
+    /// @notice Settle the protocol fee BEFORE _handleIntent runs.
+    /// @dev Private — non-overridable. Apps customize only the amount via
+    ///      `_calculateProtocolFee`. The settlement path itself cannot be skipped.
+    ///
+    ///      USER mode: pulls fee from user via safeTransferFrom. Atomic — if user
+    ///        lacks balance/allowance the entire executeIntent reverts.
+    ///        Skipped only on native-input swaps (msg.value > 0) — the user is
+    ///        paying via msg.value and has no separate WETH to pull from.
+    ///      APP mode: returns (feeOwed, balanceBefore). The base re-checks AFTER
+    ///        `_handleIntent` that the collector balance grew by at least feeOwed.
+    ///
+    /// @return feeOwed The fee amount still owed AFTER this call (0 if settled
+    ///         here in USER mode or skipped on native input).
+    /// @return collectorBefore Snapshot of platformFeeCollector's balance in
+    ///         wrappedNativeToken at the start of execution (0 when not in APP mode).
+    function _settleProtocolFeePre(
+        IntentOrder calldata order
+    ) private returns (uint256 feeOwed, uint256 collectorBefore) {
+        uint256 raw = _calculateProtocolFee(order);
+        feeOwed = _clampFee(raw);
+
+        if (feeOwed == 0) return (0, 0);
         require(platformFeeCollector != address(0), "No fee collector");
 
-        wrappedNativeToken.safeTransferFrom(user, platformFeeCollector, feeWei);
-        emit PlatformFeeCollected(orderId, user, feeWei);
+        if (feeMode == FeeMode.USER) {
+            // Native input path: user has no WETH to pull from. Apps that want
+            // to charge a fee in native-input flows must override
+            // `_calculateProtocolFee` to return 0 in that case, OR run in APP
+            // mode and source the fee from msg.value internally.
+            if (msg.value > 0) return (0, 0);
+
+            wrappedNativeToken.safeTransferFrom(order.submittedBy, platformFeeCollector, feeOwed);
+            emit PlatformFeeCollected(order.orderId, order.submittedBy, feeOwed);
+            return (0, 0);
+        }
+
+        // APP mode — leave the obligation for _verifyFeeSettlementPost.
+        collectorBefore = wrappedNativeToken.balanceOf(platformFeeCollector);
+        return (feeOwed, collectorBefore);
+    }
+
+    /// @notice Verify the protocol fee was delivered in APP mode.
+    /// @dev Private — non-overridable. Reverts the entire transaction if the
+    ///      collector balance did not grow by at least the owed amount. This
+    ///      makes the fee MANDATORY — the app cannot skip or reduce it without
+    ///      reverting the order (which makes the user whole).
+    function _verifyFeeSettlementPost(
+        bytes32 orderId,
+        address user,
+        uint256 feeOwed,
+        uint256 collectorBefore
+    ) private {
+        if (feeOwed == 0) return;
+        uint256 collectorAfter = wrappedNativeToken.balanceOf(platformFeeCollector);
+        require(collectorAfter >= collectorBefore + feeOwed, "Protocol fee not paid");
+        emit PlatformFeeCollected(orderId, user, collectorAfter - collectorBefore);
     }
 
     // ── Views ────────────────────────────────────────────────────────────

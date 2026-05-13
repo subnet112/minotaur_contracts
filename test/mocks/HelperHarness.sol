@@ -15,7 +15,14 @@ contract HelperHarness is AppIntentBase {
         address _wrappedNativeToken,
         address _platformFeeCollector,
         uint256 _maxPlatformFeeWei
-    ) AppIntentBase(_relayer, _validatorRegistry, _quorumBps, _scoreThreshold, _wrappedNativeToken, _platformFeeCollector, _maxPlatformFeeWei) {
+    ) AppIntentBase(
+        _relayer, _validatorRegistry, _quorumBps, _scoreThreshold,
+        _wrappedNativeToken, _platformFeeCollector,
+        0,                          // minPlatformFeeWei (test helper — no floor)
+        _maxPlatformFeeWei,
+        FeeMode.USER,               // default mode for helper tests
+        address(0)                  // appPaymaster
+    ) {
         registeredIntents[TEST_SELECTOR] = true;
     }
 
