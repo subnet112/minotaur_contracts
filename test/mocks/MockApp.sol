@@ -9,6 +9,10 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 /// @notice Implements a simple swap intent: pull input tokens, execute plan,
 ///         verify output tokens received. Used by E2E and AppIntentBase tests
 ///         as a concrete app without depending on DexAggregatorApp.
+///
+///         Test-only: deploys in USER mode with minPlatformFeeWei = 0 so most
+///         tests do not have to worry about fee settlement. Individual tests
+///         that exercise fee logic set the mode + paymaster via admin setters.
 contract MockApp is AppIntentBase {
     using SafeERC20 for IERC20;
 
@@ -28,7 +32,11 @@ contract MockApp is AppIntentBase {
         uint256  // _feeBps (unused)
     ) AppIntentBase(
         _relayer, _validatorRegistry, _quorumBps, _scoreThreshold,
-        _wrappedNativeToken, _platformFeeCollector, _maxPlatformFeeWei
+        _wrappedNativeToken, _platformFeeCollector,
+        0,                          // minPlatformFeeWei — tests opt-in via setMinPlatformFeeWei
+        _maxPlatformFeeWei,
+        FeeMode.USER,               // default to USER mode for backwards-compatible test paths
+        address(0)                  // appPaymaster (unused in USER mode)
     ) {
         registeredIntents[SWAP_SELECTOR] = true;
     }
@@ -55,9 +63,4 @@ contract MockApp is AppIntentBase {
         score = _scoreLinear(gained, minAmountOut);
         valid = true;
     }
-
-    /// @notice No-op platform fee (tests don't need fee logic)
-    function _collectPlatformFee(
-        bytes32, address, bytes calldata
-    ) internal pure override {}
 }
