@@ -10,13 +10,12 @@ contract HelperHarness is AppIntentBase {
     constructor(
         address _relayer,
         address _validatorRegistry,
-        uint256 _quorumBps,
         uint256 _scoreThreshold,
         address _wrappedNativeToken,
         address _platformFeeCollector,
         uint256 _maxPlatformFeeWei
     ) AppIntentBase(
-        _relayer, _validatorRegistry, _quorumBps, _scoreThreshold,
+        _relayer, _validatorRegistry, _scoreThreshold,
         _wrappedNativeToken, _platformFeeCollector,
         0,                          // minPlatformFeeWei (test helper — no floor)
         _maxPlatformFeeWei,

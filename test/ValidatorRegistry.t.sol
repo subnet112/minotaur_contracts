@@ -9,6 +9,7 @@ contract ValidatorRegistryTest is Test {
 
     address public owner;
     address[] public initialValidators;
+    uint256 public constant DEFAULT_QUORUM = 6666;
 
     function setUp() public {
         owner = address(0xA11CE);
@@ -16,7 +17,7 @@ contract ValidatorRegistryTest is Test {
         initialValidators.push(address(0x200));
         initialValidators.push(address(0x300));
 
-        registry = new ValidatorRegistry(owner, initialValidators);
+        registry = new ValidatorRegistry(owner, initialValidators, DEFAULT_QUORUM);
     }
 
     function test_constructorSetsValidators() public view {
@@ -26,6 +27,10 @@ contract ValidatorRegistryTest is Test {
         assertEq(vals[1], address(0x200));
         assertEq(vals[2], address(0x300));
         assertEq(registry.owner(), owner);
+    }
+
+    function test_constructorSetsQuorumBps() public view {
+        assertEq(registry.quorumBps(), DEFAULT_QUORUM);
     }
 
     function test_isValidator() public view {
@@ -95,6 +100,62 @@ contract ValidatorRegistryTest is Test {
         registry.updateValidators(bad);
     }
 
+    // ── quorumBps management ─────────────────────────────────────────────
+
+    function test_setQuorumBps() public {
+        vm.prank(owner);
+        registry.setQuorumBps(8000);
+        assertEq(registry.quorumBps(), 8000);
+    }
+
+    function test_setQuorumBps_onlyOwner() public {
+        vm.expectRevert("Only owner");
+        registry.setQuorumBps(8000);
+    }
+
+    function test_setQuorumBps_emitsEvent() public {
+        vm.prank(owner);
+        vm.expectEmit(false, false, false, true);
+        emit IValidatorRegistry.QuorumBpsUpdated(8000);
+        registry.setQuorumBps(8000);
+    }
+
+    function test_setQuorumBps_rejectsZero() public {
+        vm.prank(owner);
+        vm.expectRevert("Invalid quorum");
+        registry.setQuorumBps(0);
+    }
+
+    function test_setQuorumBps_rejectsAboveMax() public {
+        vm.prank(owner);
+        vm.expectRevert("Invalid quorum");
+        registry.setQuorumBps(10001);
+    }
+
+    function test_setQuorumBps_acceptsMax() public {
+        vm.prank(owner);
+        registry.setQuorumBps(10000);
+        assertEq(registry.quorumBps(), 10000);
+    }
+
+    function test_constructorRejectsZeroQuorum() public {
+        address[] memory vals = new address[](1);
+        vals[0] = address(0x100);
+
+        vm.expectRevert("Invalid quorum");
+        new ValidatorRegistry(owner, vals, 0);
+    }
+
+    function test_constructorRejectsAboveMaxQuorum() public {
+        address[] memory vals = new address[](1);
+        vals[0] = address(0x100);
+
+        vm.expectRevert("Invalid quorum");
+        new ValidatorRegistry(owner, vals, 10001);
+    }
+
+    // ── Ownership ───────────────────────────────────────────────────────
+
     function test_transferOwnership() public {
         address newOwner = address(0xBEEF);
 
@@ -120,14 +181,14 @@ contract ValidatorRegistryTest is Test {
         vals[0] = address(0x100);
 
         vm.expectRevert("Invalid owner");
-        new ValidatorRegistry(address(0), vals);
+        new ValidatorRegistry(address(0), vals, DEFAULT_QUORUM);
     }
 
     function test_constructorRejectsEmptyValidators() public {
         address[] memory empty = new address[](0);
 
         vm.expectRevert("No validators");
-        new ValidatorRegistry(owner, empty);
+        new ValidatorRegistry(owner, empty, DEFAULT_QUORUM);
     }
 
     function test_constructorRejectsDuplicateValidators() public {
@@ -136,7 +197,7 @@ contract ValidatorRegistryTest is Test {
         dupes[1] = address(0x100);
 
         vm.expectRevert("Duplicate validator");
-        new ValidatorRegistry(owner, dupes);
+        new ValidatorRegistry(owner, dupes, DEFAULT_QUORUM);
     }
 
     function test_updateValidatorsRejectsDuplicates() public {

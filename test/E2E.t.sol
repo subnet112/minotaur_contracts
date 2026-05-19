@@ -50,8 +50,8 @@ contract E2ETest is Test {
         weth = new MockToken("Wrapped ETH", "WETH", 18);
         usdc = new MockToken("USD Coin", "USDC", 6);
         router = new TestSwapRouter();
-        registry = new ValidatorRegistry(relayerAddr, validatorAddrs);
-        app = new MockApp(relayerAddr, address(registry), 8000, 5000, address(weth), relayerAddr, 0.1 ether, feeCollector, 5000);
+        registry = new ValidatorRegistry(relayerAddr, validatorAddrs, 8000);
+        app = new MockApp(relayerAddr, address(registry), 5000, address(weth), relayerAddr, 0.1 ether, feeCollector, 5000);
 
         DOMAIN_SEPARATOR = app.DOMAIN_SEPARATOR();
         SWAP_SELECTOR = app.SWAP_SELECTOR();
