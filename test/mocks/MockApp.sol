@@ -36,7 +36,8 @@ contract MockApp is AppIntentBase {
         0,                          // minPlatformFeeWei — tests opt-in via setMinPlatformFeeWei
         _maxPlatformFeeWei,
         FeeMode.USER,               // default to USER mode for backwards-compatible test paths
-        address(0)                  // appPaymaster (unused in USER mode)
+        address(0),                 // appPaymaster (unused in USER mode)
+        address(0)                  // appRegistry — disabled for legacy mock tests
     ) {
         registeredIntents[SWAP_SELECTOR] = true;
     }
