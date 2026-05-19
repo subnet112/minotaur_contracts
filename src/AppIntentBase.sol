@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/IAppIntentBase.sol";
+import "./interfaces/IAppRegistry.sol";
 import "./interfaces/IValidatorRegistry.sol";
 import "./EphemeralProxy.sol";
 import "./EIP712Verifier.sol";
@@ -49,6 +50,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
     address public immutable relayer;
     address public immutable validatorRegistry;
+    IAppRegistry public immutable appRegistry;   // address(0) = registry check disabled
     uint256 public quorumBps;          // e.g. 8000 = 80%
     uint256 public scoreThreshold;     // BPS, default 5000
 
@@ -124,6 +126,10 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     ///        when _feeMode == APP. Apps may use this for off-chain monitoring; the contract
     ///        does not enforce funds come from this exact address — only that the collector
     ///        balance increased by at least the owed amount during _handleIntent.
+    /// @param _appRegistry Address of the AppRegistry that authorises this App. When set
+    ///        to a non-zero address, executeIntent / executeLeg require the contract to
+    ///        be registered in `appRegistry.appByContract` or revert. address(0) disables
+    ///        the check — intended for test fixtures and pre-registry deployments.
     constructor(
         address _relayer,
         address _validatorRegistry,
@@ -134,7 +140,8 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         uint256 _minPlatformFeeWei,
         uint256 _maxPlatformFeeWei,
         FeeMode _feeMode,
-        address _appPaymaster
+        address _appPaymaster,
+        address _appRegistry
     ) {
         require(_relayer != address(0), "Invalid relayer");
         require(_validatorRegistry != address(0), "Invalid registry");
@@ -143,6 +150,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
         relayer = _relayer;
         validatorRegistry = _validatorRegistry;
+        appRegistry = IAppRegistry(_appRegistry);
         quorumBps = _quorumBps;
         scoreThreshold = _scoreThreshold >= 5000 ? _scoreThreshold : 5000;
 
@@ -163,6 +171,18 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         ));
     }
 
+    /// @notice Revert if the registry is configured and this contract is not
+    ///         registered (or has been revoked). When appRegistry is the
+    ///         zero address, the check is bypassed entirely.
+    function _requireRegistered() internal view {
+        if (address(appRegistry) != address(0)) {
+            require(
+                appRegistry.appByContract(address(this)) != bytes32(0),
+                "App not registered"
+            );
+        }
+    }
+
     // ── Core execution ───────────────────────────────────────────────────
 
     /// @notice Execute an intent order with validator consensus
@@ -180,6 +200,11 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
         // 1. Verify intent function is registered
         require(registeredIntents[order.intentSelector], "Intent not registered");
+
+        // 1b. Verify this App contract is authorised by the registry. Cheap
+        //     external view; skipped entirely when appRegistry == address(0)
+        //     for test fixtures and pre-registry deployments.
+        _requireRegistered();
 
         // 2. Check chain and deadline
         require(order.chainId == block.chainid, "Wrong chain");
@@ -312,6 +337,9 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
         // 1. Verify intent function is registered
         require(registeredIntents[order.intentSelector], "Intent not registered");
+
+        // 1b. Verify this App contract is authorised by the registry.
+        _requireRegistered();
 
         // 2. Check chain and deadline
         require(order.chainId == block.chainid, "Wrong chain");

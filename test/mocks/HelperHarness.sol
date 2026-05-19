@@ -21,7 +21,8 @@ contract HelperHarness is AppIntentBase {
         0,                          // minPlatformFeeWei (test helper — no floor)
         _maxPlatformFeeWei,
         FeeMode.USER,               // default mode for helper tests
-        address(0)                  // appPaymaster
+        address(0),                 // appPaymaster
+        address(0)                  // appRegistry — disabled for legacy harness tests
     ) {
         registeredIntents[TEST_SELECTOR] = true;
     }
