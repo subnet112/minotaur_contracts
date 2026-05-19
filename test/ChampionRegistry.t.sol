@@ -31,11 +31,12 @@ contract ChampionRegistryTest is Test {
         // Sort validators by address (required for signature verification)
         _sortValidators();
 
-        // Deploy ValidatorRegistry + ChampionRegistry
-        validatorReg = new ValidatorRegistry(owner, validatorAddrs);
+        // Deploy ValidatorRegistry (also holds quorum, but ChampionRegistry keeps
+        // its own quorum knob — see refactor/single-quorum-source out-of-scope note).
+        validatorReg = new ValidatorRegistry(owner, validatorAddrs, 6666);
         registry = new ChampionRegistry(
             address(validatorReg),
-            6666,   // quorumBps: 2-of-3
+            6666,   // quorumBps: 2-of-3 (ChampionRegistry's own field)
             owner
         );
 

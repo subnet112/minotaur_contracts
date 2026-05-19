@@ -21,8 +21,7 @@ contract MockGatedApp is AppIntentBase {
     ) AppIntentBase(
         _relayer,
         _validatorRegistry,
-        8000,                // quorumBps
-        5000,                // scoreThreshold
+        5000,                // scoreThreshold (quorum now sourced from ValidatorRegistry)
         address(0),          // wrappedNativeToken — unused in these tests
         address(0),          // platformFeeCollector
         0,                   // minPlatformFeeWei
@@ -382,7 +381,7 @@ contract AppRegistryIntegrationTest is Test {
         // so the exact set is irrelevant for these tests.
         address[] memory validators = new address[](1);
         validators[0] = makeAddr("v1");
-        validatorRegistry = new ValidatorRegistry(relayerAddr, validators);
+        validatorRegistry = new ValidatorRegistry(relayerAddr, validators, 8000);
         registry = new AppRegistry(owner);
 
         // gatedApp wires the registry through; ungatedApp passes address(0)
