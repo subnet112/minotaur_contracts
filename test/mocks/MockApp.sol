@@ -23,7 +23,6 @@ contract MockApp is AppIntentBase {
     constructor(
         address _relayer,
         address _validatorRegistry,
-        uint256 _quorumBps,
         uint256 _scoreThreshold,
         address _wrappedNativeToken,
         address _platformFeeCollector,
@@ -31,7 +30,7 @@ contract MockApp is AppIntentBase {
         address, // _feeCollector (unused, matches DexAggregatorApp signature for test compat)
         uint256  // _feeBps (unused)
     ) AppIntentBase(
-        _relayer, _validatorRegistry, _quorumBps, _scoreThreshold,
+        _relayer, _validatorRegistry, _scoreThreshold,
         _wrappedNativeToken, _platformFeeCollector,
         0,                          // minPlatformFeeWei — tests opt-in via setMinPlatformFeeWei
         _maxPlatformFeeWei,

@@ -17,6 +17,7 @@ import "../src/ValidatorRegistry.sol";
 ///   VALIDATORS                - comma-separated EVM addresses of the initial
 ///                               validator set (must be non-empty, no dupes)
 ///   VALIDATOR_REGISTRY_OWNER  - optional; defaults to deployer address
+///   QUORUM_BPS                - optional; defaults to 6666 (2-of-3 BFT)
 ///
 /// Output (parseable):
 ///   VALIDATOR_REGISTRY=0x...
@@ -25,6 +26,7 @@ contract DeployValidatorRegistry is Script {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
         address owner = vm.envOr("VALIDATOR_REGISTRY_OWNER", deployer);
+        uint256 quorumBps = vm.envOr("QUORUM_BPS", uint256(6666));
 
         string memory validatorsStr = vm.envString("VALIDATORS");
         address[] memory validators = _parseAddresses(validatorsStr);
@@ -35,18 +37,20 @@ contract DeployValidatorRegistry is Script {
         console.log("Chain ID:", block.chainid);
         console.log("Deployer (pays gas):", deployer);
         console.log("Owner (registry admin):", owner);
+        console.log("Quorum (bps):", quorumBps);
         console.log("Validator count:", validators.length);
         for (uint256 i = 0; i < validators.length; i++) {
             console.log("  validator", i, ":", validators[i]);
         }
 
         vm.startBroadcast(deployerKey);
-        ValidatorRegistry registry = new ValidatorRegistry(owner, validators);
+        ValidatorRegistry registry = new ValidatorRegistry(owner, validators, quorumBps);
         vm.stopBroadcast();
 
         console.log("");
         console.log("=== DEPLOYED ===");
         console.log("VALIDATOR_REGISTRY=%s", vm.toString(address(registry)));
+        console.log("QUORUM_BPS=%s", vm.toString(quorumBps));
     }
 
     function _parseAddresses(string memory csv) internal pure returns (address[] memory) {
