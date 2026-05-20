@@ -8,6 +8,11 @@ import "../src/ValidatorRegistry.sol";
 /// @notice Only deploys ValidatorRegistry. App contracts are deployed through
 ///         the Minotaur pipeline (create_app_intent → deploy_app_intent).
 ///         Outputs KEY=VALUE lines for Python parsing.
+///
+///         Env:
+///           DEPLOYER_PRIVATE_KEY (required)
+///           VALIDATORS           (comma-separated addresses)
+///           QUORUM_BPS           (optional, defaults to 6666 = 2-of-3 BFT)
 contract DeployTestStack is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -17,16 +22,19 @@ contract DeployTestStack is Script {
         string memory validatorsStr = vm.envString("VALIDATORS");
         address[] memory validators = _parseAddresses(validatorsStr);
 
+        uint256 quorumBps = vm.envOr("QUORUM_BPS", uint256(6666));
+
         vm.startBroadcast(deployerKey);
 
-        // Deploy ValidatorRegistry (needed by all app contracts)
-        ValidatorRegistry registry = new ValidatorRegistry(relayer, validators);
+        // Deploy ValidatorRegistry (holds validator set + canonical quorumBps)
+        ValidatorRegistry registry = new ValidatorRegistry(relayer, validators, quorumBps);
 
         vm.stopBroadcast();
 
         // Output for Python parsing
         console.log("REGISTRY_ADDRESS=%s", vm.toString(address(registry)));
         console.log("RELAYER_ADDRESS=%s", vm.toString(relayer));
+        console.log("QUORUM_BPS=%s", vm.toString(quorumBps));
     }
 
     function _parseAddresses(string memory csv) internal pure returns (address[] memory) {

@@ -3,24 +3,32 @@ pragma solidity ^0.8.24;
 
 import "./interfaces/IValidatorRegistry.sol";
 
-/// @title ValidatorRegistry - Shared validator set for all App Intent contracts
+/// @title ValidatorRegistry - Shared validator set + quorum for all App Intent contracts
 /// @notice Deploy ONE per chain. All AppIntentBase contracts reference it.
-///         Relayer updates validators here instead of on every app.
+///         The owner controls both the validator set (updateValidators) and
+///         the network-wide quorum threshold (setQuorumBps).
 contract ValidatorRegistry is IValidatorRegistry {
     address public owner;
     address[] public validators;
     mapping(address => bool) public isValidator;
+    uint256 public quorumBps;
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
         _;
     }
 
-    constructor(address _owner, address[] memory _validators) {
+    constructor(
+        address _owner,
+        address[] memory _validators,
+        uint256 _quorumBps
+    ) {
         require(_owner != address(0), "Invalid owner");
         require(_validators.length > 0, "No validators");
+        require(_quorumBps > 0 && _quorumBps <= 10000, "Invalid quorum");
 
         owner = _owner;
+        quorumBps = _quorumBps;
 
         for (uint256 i = 0; i < _validators.length; i++) {
             require(_validators[i] != address(0), "Invalid validator");
@@ -57,6 +65,17 @@ contract ValidatorRegistry is IValidatorRegistry {
         }
 
         emit ValidatorsUpdated(_validators);
+    }
+
+    /// @notice Update the network-wide quorum threshold in basis points.
+    /// @dev All AppIntentBase contracts referencing this registry read quorumBps
+    ///      at verification time, so a single owner tx reconfigures every App on
+    ///      this chain. Off-chain validators are expected to poll this value and
+    ///      refresh their local cache (default cadence: once per epoch).
+    function setQuorumBps(uint256 _quorumBps) external onlyOwner {
+        require(_quorumBps > 0 && _quorumBps <= 10000, "Invalid quorum");
+        quorumBps = _quorumBps;
+        emit QuorumBpsUpdated(_quorumBps);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {

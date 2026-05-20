@@ -45,10 +45,10 @@ contract AppIntentBaseTest is Test {
         // Sort validators by address (required for signature verification)
         _sortValidators();
 
-        // Deploy registry first, then app
-        registry = new ValidatorRegistry(relayerAddr, validatorAddrs);
+        // Deploy registry first (holds canonical quorumBps), then app
+        registry = new ValidatorRegistry(relayerAddr, validatorAddrs, 8000);
         weth = new MockToken("Wrapped ETH", "WETH", 18);
-        app = new MockApp(relayerAddr, address(registry), 8000, 5000, address(weth), relayerAddr, 0.1 ether, feeCollector, 5000);
+        app = new MockApp(relayerAddr, address(registry), 5000, address(weth), relayerAddr, 0.1 ether, feeCollector, 5000);
         usdc = new MockToken("USD Coin", "USDC", 6);
         router = new MockRouter();
 
@@ -205,8 +205,8 @@ contract AppIntentBaseHelpersTest is Test {
 
         address[] memory validators = new address[](1);
         validators[0] = address(0x100);
-        registry = new ValidatorRegistry(relayerAddr, validators);
-        harness = new HelperHarness(relayerAddr, address(registry), 8000, 5000, address(0), address(0), 0);
+        registry = new ValidatorRegistry(relayerAddr, validators, 8000);
+        harness = new HelperHarness(relayerAddr, address(registry), 5000, address(0), address(0), 0);
 
         tokenA = new MockToken("Token A", "TKA", 18);
         tokenB = new MockToken("Token B", "TKB", 18);
@@ -372,7 +372,7 @@ contract AppIntentBaseNativeFundingTest is Test {
 
         address[] memory validators = new address[](1);
         validators[0] = address(0x100);
-        registry = new ValidatorRegistry(relayerAddr, validators);
+        registry = new ValidatorRegistry(relayerAddr, validators, 8000);
 
         // Real WETH9-compatible mock for the native path.
         weth = new MockWETH9();
@@ -380,7 +380,6 @@ contract AppIntentBaseNativeFundingTest is Test {
         harness = new HelperHarness(
             relayerAddr,
             address(registry),
-            8000,          // quorumBps
             5000,          // scoreThreshold
             address(weth), // wrappedNativeToken
             address(0),    // platformFeeCollector
