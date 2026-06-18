@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
 import "../src/ValidatorRegistry.sol";
+import {ChampionRegistry} from "../src/ChampionRegistry.sol";
 
 /// @title DeployTestStack - Deploys infrastructure for the local testnet
 /// @notice Only deploys ValidatorRegistry. App contracts are deployed through
@@ -29,10 +30,18 @@ contract DeployTestStack is Script {
         // Deploy ValidatorRegistry (holds validator set + canonical quorumBps)
         ValidatorRegistry registry = new ValidatorRegistry(relayer, validators, quorumBps);
 
+        // Deploy ChampionRegistry (delegates the validator set to the
+        // ValidatorRegistry above; keeps its own quorumBps for champion
+        // certification). This lets the testnet exercise the champion
+        // consensus path with a real on-chain registry instead of relying on
+        // a silent fallback to ValidatorRegistry.
+        ChampionRegistry championRegistry = new ChampionRegistry(address(registry), quorumBps, relayer);
+
         vm.stopBroadcast();
 
         // Output for Python parsing
         console.log("REGISTRY_ADDRESS=%s", vm.toString(address(registry)));
+        console.log("CHAMPION_REGISTRY_ADDRESS=%s", vm.toString(address(championRegistry)));
         console.log("RELAYER_ADDRESS=%s", vm.toString(relayer));
         console.log("QUORUM_BPS=%s", vm.toString(quorumBps));
     }
