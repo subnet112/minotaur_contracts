@@ -440,7 +440,7 @@ contract AppRegistryIntegrationTest is Test {
         // verification, which fails with OpenZeppelin's ECDSA custom error
         // because we passed an empty signature. The exact error confirms we
         // made it past the registry gate to a downstream check.
-        vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", 0));
+        vm.expectRevert("Invalid user signature"); // #229: SignatureChecker returns false (clean app error) instead of OZ ECDSA deep-revert
         gatedApp.executeIntent(order, plan, hex"", sigs);
     }
 
@@ -468,7 +468,7 @@ contract AppRegistryIntegrationTest is Test {
         IAppIntentBase.ExecutionPlan memory plan = _emptyPlan();
         bytes[] memory sigs = new bytes[](0);
 
-        vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", 0));
+        vm.expectRevert("Invalid user signature"); // #229: SignatureChecker returns false (clean app error) instead of OZ ECDSA deep-revert
         ungatedApp.executeIntent(order, plan, hex"", sigs);
     }
 }

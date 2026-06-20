@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import "./interfaces/IAppIntentBase.sol";
 import "./interfaces/IValidatorRegistry.sol";
 
@@ -42,15 +43,31 @@ library EIP712Verifier {
         return MessageHashUtils.toTypedDataHash(domainSeparator, structHash);
     }
 
-    /// @notice Verify a user's EIP-712 signature on an IntentOrder
+    /// @notice Verify a user's EIP-712 signature on an IntentOrder.
+    /// @dev Accepts both EOA (ECDSA) and smart-account (ERC-1271) signatures via
+    ///      OZ SignatureChecker, and normalizes a non-canonical recovery byte
+    ///      (v in {0,1} -> {27,28}) for 65-byte EOA signatures. Previously this
+    ///      used strict ECDSA.recover, which rejected v not in {27,28} (the 0/1
+    ///      form emitted by viem/ethers low-level paths, several hardware wallets,
+    ///      and WalletConnect) and had no ERC-1271 path, so Coinbase Smart Wallet /
+    ///      Safe accounts (common on Base) could not transact at all. See #229.
+    ///      `view` (not `pure`) because the ERC-1271 path makes a staticcall.
     function verifyUserSignature(
         IAppIntentBase.IntentOrder calldata order,
         bytes calldata signature,
         bytes32 domainSeparator
-    ) internal pure returns (bool) {
+    ) internal view returns (bool) {
         bytes32 digest = hashOrder(order, domainSeparator);
-        address recovered = digest.recover(signature);
-        return recovered == order.submittedBy;
+        bytes memory sig = signature;
+        // Normalize the recovery byte only for a standard 65-byte ECDSA signature;
+        // ERC-1271 signatures use account-defined encodings and are passed through.
+        if (sig.length == 65) {
+            uint8 v = uint8(sig[64]);
+            if (v < 27) {
+                sig[64] = bytes1(v + 27);
+            }
+        }
+        return SignatureChecker.isValidSignatureNow(order.submittedBy, digest, sig);
     }
 
     /// @notice Hash a plan approval for validator signing
