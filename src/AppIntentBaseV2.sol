@@ -269,6 +269,27 @@ abstract contract AppIntentBaseV2 is IAppIntentBase, ReentrancyGuardTransient {
         uint256 gasUsed
     );
 
+    /// @notice When true, every leg execution must go through
+    ///         executeLegSigned — the user's plan-set signature becomes
+    ///         mandatory and the legacy validator-quorum-only paths revert.
+    ///         Deploys false (legacy-compatible); the platform flips it on
+    ///         once its pipeline emits plan-set signatures, closing the
+    ///         "destination leg executes with an empty user signature" hole
+    ///         (docs/architecture/cross-chain-intents.md §5 in
+    ///         minotaur_subnet).
+    bool public planSetSignatureRequired;
+
+    event PlanSetVerified(
+        bytes32 indexed orderId,
+        bytes32 planSetHash,
+        uint256 legIndex,
+        uint256 setPosition
+    );
+
+    function setPlanSetSignatureRequired(bool _required) external onlyRelayer {
+        planSetSignatureRequired = _required;
+    }
+
     function executeLeg(
         IntentOrder calldata order,
         ExecutionPlan calldata plan,
@@ -276,7 +297,7 @@ abstract contract AppIntentBaseV2 is IAppIntentBase, ReentrancyGuardTransient {
         bytes calldata userSignature,
         bytes[] calldata validatorSignatures
     ) external payable nonReentrant {
-        _executeLegInternal(order, plan, legIndex, userSignature, validatorSignatures);
+        _executeLegInternal(order, plan, legIndex, userSignature, validatorSignatures, false);
     }
 
     /// @notice Deprecated: use executeLeg instead. Retained so V2 is a
@@ -290,7 +311,52 @@ abstract contract AppIntentBaseV2 is IAppIntentBase, ReentrancyGuardTransient {
         bytes calldata userSignature,
         bytes[] calldata validatorSignatures
     ) external payable nonReentrant {
-        _executeLegInternal(order, plan, legIndex, userSignature, validatorSignatures);
+        _executeLegInternal(order, plan, legIndex, userSignature, validatorSignatures, false);
+    }
+
+    /// @notice Execute a leg under the user's PLAN-SET signature: the user
+    ///         signed (once, at quote acceptance, chain-agnostic domain) the
+    ///         ordered hashes of EVERY leg plan — forward legs first, then
+    ///         revert/rollback legs. The executed plan must be a member of
+    ///         that signed set, so neither the relayer nor a colluding
+    ///         validator quorum can substitute a recovery path the user
+    ///         never agreed to. Refreshed (re-quoted) legs require a fresh
+    ///         signature over the updated set by construction.
+    /// @param planSetHashes The full ordered plan-hash set the user signed.
+    /// @param setPosition   This plan's index within planSetHashes.
+    /// @param userSignature REQUIRED — signature over
+    ///                      PlanSetApproval(orderId, keccak256(planSetHashes)).
+    function executeLegSigned(
+        IntentOrder calldata order,
+        ExecutionPlan calldata plan,
+        uint256 legIndex,
+        bytes32[] calldata planSetHashes,
+        uint256 setPosition,
+        bytes calldata userSignature,
+        bytes[] calldata validatorSignatures
+    ) external payable nonReentrant {
+        require(userSignature.length > 0, "Plan-set signature required");
+        require(setPosition < planSetHashes.length, "Set position out of range");
+        require(
+            planSetHashes[setPosition] == EIP712Verifier.hashPlan(plan),
+            "Plan not in signed set"
+        );
+        bytes32 planSetHash = keccak256(abi.encodePacked(planSetHashes));
+        require(
+            EIP712Verifier.verifyPlanSetSignature(
+                order.submittedBy, order.orderId, planSetHash, userSignature
+            ),
+            "Invalid plan-set signature"
+        );
+        emit PlanSetVerified(order.orderId, planSetHash, legIndex, setPosition);
+
+        // Order-level user signature already superseded by the plan-set
+        // approval — pass an empty calldata slice so the internal gauntlet
+        // doesn't re-require a per-chain order signature the destination
+        // chain can't have.
+        _executeLegInternal(
+            order, plan, legIndex, userSignature[0:0], validatorSignatures, true
+        );
     }
 
     function _executeLegInternal(
@@ -298,7 +364,8 @@ abstract contract AppIntentBaseV2 is IAppIntentBase, ReentrancyGuardTransient {
         ExecutionPlan calldata plan,
         uint256 legIndex,
         bytes calldata userSignature,
-        bytes[] calldata validatorSignatures
+        bytes[] calldata validatorSignatures,
+        bool planSetVerified
     ) internal {
         uint256 startGas = gasleft();
 
@@ -309,6 +376,12 @@ abstract contract AppIntentBaseV2 is IAppIntentBase, ReentrancyGuardTransient {
 
         // Per-leg replay protection (must stay in storage: legs span txs)
         require(!legExecuted[order.orderId][legIndex], "Leg already executed");
+
+        // Enforcement: once armed, only the plan-set-signed path may execute
+        // legs — quorum alone no longer suffices.
+        if (planSetSignatureRequired) {
+            require(planSetVerified, "Plan-set signature required");
+        }
 
         if (escrow[order.orderId][legIndex].amount > 0) {
             require(escrow[order.orderId][legIndex].released, "Escrow not released");
