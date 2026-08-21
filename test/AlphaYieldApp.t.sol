@@ -25,6 +25,7 @@ contract AlphaYieldAppTest is Test {
     bytes32 constant HK_A = bytes32(uint256(0xAA));   // uid 0: big stake, mediocre rate
     bytes32 constant HK_B = bytes32(uint256(0xBB));   // uid 1: the best allowlisted rate
     bytes32 constant HK_OUT = bytes32(uint256(0xFF)); // uid 9: best rate on the subnet, NOT allowlisted
+    bytes32 constant HK_TINY = bytes32(uint256(0x71)); // uid 3: huge marginal rate, tiny stake
     bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
     uint256 constant ONE_TAO = 1e18;
 
@@ -44,9 +45,16 @@ contract AlphaYieldAppTest is Test {
         vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
         meta = MockMetagraph(0x0000000000000000000000000000000000000802);
 
-        // rate = dividends / stake:  A = 53111/672.9e9,  B = 12419/100e9 (~1.57x A)
-        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 53111, true);
-        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 12419, true);
+        // Rates are DILUTION-AWARE, so the fixture is built on what each
+        // validator yields AFTER the vault's ~445.8e9 position lands on it:
+        //   A (incumbent, position already counted) 15000/672.9e9  = 22.3e-12
+        //   B (would gain the position)             35000/545.8e9  = 64.1e-12  <- best
+        // NOTE the mock metagraph is STATIC: moving stake in the mock does not
+        // grow the destination's reported stake, where the real chain would.
+        // That is fine for testing the ranking rule, and is why fixtures state
+        // post-move stake directly rather than relying on the move to produce it.
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 15000, true);
+        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 35000, true);
         meta.setNeuron(112, 9, HK_OUT, 10_000_000_000, 60000, true);
 
         vault = new AlphaVault(VAULT_CK, gov);
@@ -107,17 +115,50 @@ contract AlphaYieldAppTest is Test {
         assertEq(hk, HK_B, "the position did not follow the winning plan");
     }
 
-    function test_a_worse_validator_scores_proportionally_less() public {
-        IAppIntentBase.IntentOrder memory o_score = _order(112);
-        IAppIntentBase.ExecutionPlan memory p_score = _plan(HK_A, 0);
-        vm.prank(relayer);
-        (uint256 score,) = app.scoreIntent(o_score, p_score);
-
+    /// Min-max across the allowlist: the WORST eligible pick scores 0, not some
+    /// consoling fraction. With only two candidates the loser is the worst.
+    function test_the_worst_allowlisted_pick_scores_zero() public {
         uint256 rA = app.rateOf(112, 0);
         uint256 rB = app.rateOf(112, 1);
         assertLt(rA, rB, "fixture is wrong: A should be the worse validator");
-        assertEq(score, (rA * 10000) / rB, "score is not the ratio to the optimum");
-        assertLt(score, 10000);
+
+        IAppIntentBase.IntentOrder memory o = _order(112);
+        IAppIntentBase.ExecutionPlan memory p = _plan(HK_A, 0);
+        vm.prank(relayer);
+        (uint256 score,) = app.scoreIntent(o, p);
+        assertEq(score, 0, "the worst pick was not scored 0 under min-max");
+    }
+
+    /// THE TRAP THIS METRIC EXISTS TO AVOID. A validator holding almost no stake
+    /// has a huge MARGINAL rate (dividends/stake) and looks like the obvious
+    /// pick — until the vault's position lands on it and swamps the denominator.
+    /// Measured on SN112 at fork block 8893344: uid 230 beats uid 0 by ~12,500x
+    /// marginally, and loses to it by 59% once the position actually moves.
+    function test_a_tiny_validator_with_a_huge_marginal_rate_does_not_win() public {
+        // uid 3: 8,659 dividends on 8,800,003 stake — SN112's uid 230, as measured.
+        meta.setNeuron(112, 3, HK_TINY, 8_800_003, 8659, true);
+        vm.prank(gov);
+        vault.queueCandidate(112, HK_TINY);
+        vm.warp(block.timestamp + vault.ALLOWLIST_TIMELOCK());
+        vm.prank(gov);
+        vault.commitCandidate(112, HK_TINY, 3);
+
+        uint256 position = vault.positionAlpha(112);
+        assertGt(position, 0);
+
+        // Marginal rate says TINY wins by a mile...
+        uint256 marginalTiny = (uint256(8659) * 1e18) / 8_800_003;
+        uint256 marginalIncumbent = (uint256(15000) * 1e18) / 672_893_522_735;
+        assertGt(marginalTiny, marginalIncumbent * 1000, "fixture does not reproduce the trap");
+
+        // ...but the dilution-aware rate the App uses says otherwise.
+        assertLt(
+            app.rateOf(112, 3), app.rateOf(112, 0),
+            "the tiny validator still wins once our own stake is counted"
+        );
+
+        (, uint16 bestUid,) = app.bestCandidate(112);
+        assertTrue(bestUid != 3, "the scorer picked the marginal trap");
     }
 
     /// The score does not depend on any other solver's submission — the whole

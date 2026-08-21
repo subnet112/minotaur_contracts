@@ -26,12 +26,32 @@ import {IMetagraph} from "./interfaces/IMetagraph.sol";
 /// block, namely the highest-yielding validator on the allowlist, so a plan is
 /// scored as a fraction of that optimum rather than against a champion.
 ///
-///     score = rate(chosen) / rate(best allowlisted)
+///     score = (rate(chosen) - rate(worst)) / (rate(best) - rate(worst))
 ///
-/// with `rate(uid) = dividends(uid) / stake(uid)` — the per-unit-stake return a
-/// delegator to that validator receives. Both terms are ordinary metagraph state
-/// (IMetagraph at 0x…0802), which is what makes this scorable in a fork
-/// simulation at a single block instead of requiring an epoch of waiting.
+/// normalised across the allowlist so the worst eligible pick scores 0 and the
+/// best scores 1 — full discrimination over the spread that actually exists,
+/// rather than a ratio that collapses once one candidate dominates.
+///
+/// RATE IS DILUTION-AWARE, AND THAT IS NOT A DETAIL:
+///
+///     rate(uid) = dividends(uid) / (stake(uid) + position moving in)
+///
+/// The naive `dividends / stake` is a MARGINAL rate — what the next infinitesimal
+/// unit of stake earns — and using it to place a large position is a serious
+/// error. Measured on SN112 at fork block 8893344: uid 230 holds 8,659 dividends
+/// on 8,800,003 stake, which scores ~12,500x better than uid 0 on the marginal
+/// rate. Move the vault's 445.8e9 alpha onto it and the same position earns
+/// 59% LESS than uid 0 would have, because our own stake swamps a denominator
+/// that small. The marginal metric would have paid full marks for throwing away
+/// most of the yield. Including the incoming position is what makes the score
+/// answer the question actually being asked: where should THIS money go.
+///
+/// (The incumbent's metagraph stake already contains the vault's position, so it
+/// is not added twice — see `_rate`.)
+///
+/// Both terms are ordinary metagraph state (IMetagraph at 0x…0802), which is
+/// what makes this scorable in a fork simulation at a single block instead of
+/// requiring an epoch of waiting.
 ///
 /// KNOWN LIMIT, STATED PLAINLY: the formula omits the delegate TAKE, because no
 /// precompile exposes it. Actual payout is `dividends × (1 − take)`, so a
@@ -112,32 +132,52 @@ contract AlphaYieldApp is AppIntentBase {
 
     // ── the intent ───────────────────────────────────────────────────────────
 
-    /// Per-unit-stake return for one uid. Zero for a uid that is not currently a
-    /// validator or holds no stake — both make it an unusable destination, and
-    /// zero is the honest score for naming it.
+    /// What the vault's position would earn per unit if delegated to `uid`.
+    /// Zero for a uid that is not currently a validator — an unusable
+    /// destination, and zero is the honest score for naming it.
     function rateOf(uint256 netuid, uint16 uid) public view returns (uint256) {
+        return _rate(netuid, uid, vault.positionAlpha(netuid), _incumbentUid(netuid));
+    }
+
+    function _incumbentUid(uint256 netuid) internal view returns (uint16 uid) {
+        (, uid, , ,) = vault.markets(netuid);
+    }
+
+    function _rate(uint256 netuid, uint16 uid, uint256 position, uint16 incumbent)
+        internal view returns (uint256)
+    {
         uint16 n = uint16(netuid);
         if (!METAGRAPH.getValidatorStatus(n, uid)) return 0;
         uint256 stake = uint256(METAGRAPH.getStake(n, uid));
+        // The incumbent's reported stake ALREADY contains our position; every
+        // other candidate's does not, and would gain it on a move.
+        if (uid != incumbent) stake += position;
         if (stake == 0) return 0;
         return (uint256(METAGRAPH.getDividends(n, uid)) * RATE_SCALE) / stake;
     }
 
-    /// The best rate reachable inside the vault's allowlist, and who holds it.
-    /// Bounded by AlphaVault.MAX_CANDIDATES, so this cannot become unbounded work.
+    /// Best and worst rate reachable inside the vault's allowlist. Bounded by
+    /// AlphaVault.MAX_CANDIDATES, so this cannot become unbounded work.
+    function candidateRange(uint256 netuid)
+        public view returns (bytes32 bestHotkey, uint16 bestUid, uint256 bestRate, uint256 worstRate)
+    {
+        uint256 n = vault.candidateCount(netuid);
+        if (n == 0) return (bytes32(0), 0, 0, 0);
+        uint256 position = vault.positionAlpha(netuid);
+        uint16 incumbent = _incumbentUid(netuid);
+        worstRate = type(uint256).max;
+        for (uint256 i = 0; i < n; ++i) {
+            (bytes32 h, uint16 u) = vault.candidateAt(netuid, i);
+            uint256 r = _rate(netuid, u, position, incumbent);
+            if (r > bestRate) { bestRate = r; bestHotkey = h; bestUid = u; }
+            if (r < worstRate) worstRate = r;
+        }
+    }
+
     function bestCandidate(uint256 netuid)
         public view returns (bytes32 hotkey, uint16 uid, uint256 rate)
     {
-        uint256 n = vault.candidateCount(netuid);
-        for (uint256 i = 0; i < n; ++i) {
-            (bytes32 h, uint16 u) = vault.candidateAt(netuid, i);
-            uint256 r = rateOf(netuid, u);
-            if (r > rate) {
-                rate = r;
-                hotkey = h;
-                uid = u;
-            }
-        }
+        (hotkey, uid, rate,) = candidateRange(netuid);
     }
 
     /// Everything a solver needs to build a plan, in one call — the candidate
@@ -174,15 +214,14 @@ contract AlphaYieldApp is AppIntentBase {
 
         if (!vault.isCandidate(netuid, chosen)) revert NotAllowlisted(chosen);
 
-        (, , uint256 bestRate) = bestCandidate(netuid);
+        (, , uint256 bestRate, uint256 worstRate) = candidateRange(netuid);
         // No validator on the allowlist is earning anything: there is no better
         // and no worse, so there is nothing to score. Fail rather than hand out
         // full marks for a choice that cannot be distinguished.
         if (bestRate == 0) revert NoScorableYield(netuid);
 
-        uint256 chosenRate = rateOf(netuid, uid);
-
-        (bytes32 current, , , ,) = vault.markets(netuid);
+        (bytes32 current, uint16 incumbent, , ,) = vault.markets(netuid);
+        uint256 chosenRate = _rate(netuid, uid, vault.positionAlpha(netuid), incumbent);
         bool moved;
         if (chosen != current) {
             // Reverts if the uid no longer maps to this hotkey, if the cooldown
@@ -192,8 +231,13 @@ contract AlphaYieldApp is AppIntentBase {
             moved = true;
         }
 
-        score = (chosenRate * BPS) / bestRate;
-        if (score > BPS) score = BPS; // chosenRate <= bestRate by construction
+        // Min-max across the allowlist: worst eligible pick 0, best 1. When every
+        // candidate is identical there is no spread to grade on and any pick is
+        // the right one, so it scores full marks rather than dividing by zero.
+        score = bestRate == worstRate
+            ? BPS
+            : ((chosenRate - worstRate) * BPS) / (bestRate - worstRate);
+        if (score > BPS) score = BPS; // worstRate <= chosenRate <= bestRate
         valid = true;
 
         emit YieldOptimized(netuid, chosen, uid, chosenRate, bestRate, moved);
