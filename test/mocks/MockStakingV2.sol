@@ -32,6 +32,11 @@ contract MockStakingV2 {
         stake[ck][hk][nid] += amount;
     }
 
+    /// A drawdown: alpha lost to slashing or to the pool moving against us.
+    function debitAlpha(bytes32 ck, bytes32 hk, uint256 nid, uint256 amount) external {
+        stake[ck][hk][nid] -= amount;
+    }
+
     function getStake(bytes32 hk, bytes32 ck, uint256 nid) external view returns (uint256) {
         return stake[ck][hk][nid];
     }
@@ -65,6 +70,21 @@ contract MockStakingV2 {
         require(stake[ck][hk][srcNid] >= amount, "exceeds stake");
         stake[ck][hk][srcNid] -= amount;
         stake[dstCk][hk][dstNid] += amount;
+    }
+
+    /// Same-netuid moves are lossless on the real chain (fork-measured, 0.0000%),
+    /// so the mock is faithful here. `moveLossBps` exists so a test can prove the
+    /// vault REVERTS on a lossy move rather than silently repricing shares.
+    uint256 public moveLossBps;
+    function setMoveLossBps(uint256 b) external { moveLossBps = b; }
+
+    function moveStake(bytes32 fromHk, bytes32 toHk, uint256 srcNid, uint256 dstNid, uint256 amount)
+        external payable
+    {
+        bytes32 ck = coldkeyOf[msg.sender];
+        require(stake[ck][fromHk][srcNid] >= amount, "exceeds stake");
+        stake[ck][fromHk][srcNid] -= amount;
+        stake[ck][toHk][dstNid] += amount - (amount * moveLossBps) / 10_000;
     }
 
     receive() external payable {}

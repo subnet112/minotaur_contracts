@@ -39,6 +39,20 @@ interface IStakingV2 {
         uint256 amountAlpha
     ) external payable;
 
+    /// Re-delegate a position between hotkeys. Measured on a Finney fork: within
+    /// a single netuid this preserves alpha 1:1 with 0.0000% loss (gas 156,151) —
+    /// it is a bookkeeping move, not an AMM round trip. That is what makes
+    /// yield-driven re-delegation economically free, and therefore worth
+    /// competing over. Crossing netuids DOES cross alpha pools and is NOT
+    /// measured here; the vault never does it.
+    function moveStake(
+        bytes32 originHotkey,
+        bytes32 destinationHotkey,
+        uint256 originNetuid,
+        uint256 destinationNetuid,
+        uint256 amountAlpha
+    ) external payable;
+
     function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid)
         external view returns (uint256);
 }

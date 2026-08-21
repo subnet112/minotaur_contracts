@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+import {AlphaVault} from "../src/AlphaVault.sol";
+import {AlphaYieldApp} from "../src/AlphaYieldApp.sol";
+import {AppIntentBase} from "../src/AppIntentBase.sol";
+import {IAppIntentBase} from "../src/interfaces/IAppIntentBase.sol";
+import {MockStakingV2} from "./mocks/MockStakingV2.sol";
+import {MockMetagraph} from "./mocks/MockMetagraph.sol";
+
+/// Validator selection as a scored Minotaur intent.
+///
+/// The property under test is that the score is ABSOLUTE and bounded: a plan is
+/// worth its fraction of the best achievable rate on the allowlist, so finding
+/// the optimum pays 10000 BPS whether or not anyone else competed that round.
+/// That is the opposite of the DEX aggregator's relative pairwise rule, and it
+/// is possible here only because the metagraph makes "best" knowable at a block.
+contract AlphaYieldAppTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+    AlphaYieldApp app;
+
+    bytes32 constant HK_A = bytes32(uint256(0xAA));   // uid 0: big stake, mediocre rate
+    bytes32 constant HK_B = bytes32(uint256(0xBB));   // uid 1: the best allowlisted rate
+    bytes32 constant HK_OUT = bytes32(uint256(0xFF)); // uid 9: best rate on the subnet, NOT allowlisted
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+    uint256 constant ONE_TAO = 1e18;
+
+    address gov = address(0x600D);
+    address relayer = address(0xC0FFEE);
+    address registry = address(0x9E61);
+    address alice = address(0xA11CE);
+
+    /// Cached in setUp because reading it from the App is an EXTERNAL call, and
+    /// an external call inside an argument consumes the pending vm.prank /
+    /// vm.expectRevert — which makes the test pass or fail for the wrong reason.
+    bytes4 sel;
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+
+        // rate = dividends / stake:  A = 53111/672.9e9,  B = 12419/100e9 (~1.57x A)
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 53111, true);
+        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 12419, true);
+        meta.setNeuron(112, 9, HK_OUT, 10_000_000_000, 60000, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+        staking.setExitFeeBps(10);
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_A, uid: 0});
+        cs[1] = AlphaVault.Candidate({hotkey: HK_B, uid: 1});
+
+        app = new AlphaYieldApp(
+            address(vault), relayer, registry, 5000,
+            address(0xA7A0), address(0), 0, 0, AppIntentBase.FeeMode.APP, address(0), address(0)
+        );
+
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "Wrapped SN112 Alpha", "wAlpha112");
+        vault.setOptimizer(address(app));
+        vm.stopPrank();
+
+        vm.deal(address(staking), 1_000_000 * ONE_TAO);
+        vm.deal(alice, 100 * ONE_TAO);
+        vm.warp(block.timestamp + 30 days);
+
+        sel = app.OPTIMIZE_YIELD();
+
+        vm.prank(alice);
+        vault.purchaseWrapped{value: ONE_TAO}(112, alice, 0);
+    }
+
+    function _order(uint256 netuid) internal view returns (IAppIntentBase.IntentOrder memory o) {
+        o.orderId = keccak256("o");
+        o.app = address(app);
+        o.intentSelector = sel;
+        o.intentParams = abi.encode(netuid);
+        o.submittedBy = alice;
+        o.chainId = block.chainid;
+        o.deadline = block.timestamp + 1 hours;
+    }
+
+    function _plan(bytes32 hotkey, uint16 uid) internal view returns (IAppIntentBase.ExecutionPlan memory p) {
+        p.calls = new IAppIntentBase.Call[](0);
+        p.deadline = block.timestamp + 1 hours;
+        p.metadata = abi.encode(hotkey, uid);
+    }
+
+    // ── the score is a fraction of a knowable optimum ────────────────────────
+
+    function test_naming_the_best_allowlisted_validator_scores_full_marks() public {
+        IAppIntentBase.IntentOrder memory o_score = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_score = _plan(HK_B, 1);
+        vm.prank(relayer);
+        (uint256 score, bool valid) = app.scoreIntent(o_score, p_score);
+        assertEq(score, 10000, "the optimum did not score 1.0");
+        assertTrue(valid);
+        (bytes32 hk,,,,) = vault.markets(112);
+        assertEq(hk, HK_B, "the position did not follow the winning plan");
+    }
+
+    function test_a_worse_validator_scores_proportionally_less() public {
+        IAppIntentBase.IntentOrder memory o_score = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_score = _plan(HK_A, 0);
+        vm.prank(relayer);
+        (uint256 score,) = app.scoreIntent(o_score, p_score);
+
+        uint256 rA = app.rateOf(112, 0);
+        uint256 rB = app.rateOf(112, 1);
+        assertLt(rA, rB, "fixture is wrong: A should be the worse validator");
+        assertEq(score, (rA * 10000) / rB, "score is not the ratio to the optimum");
+        assertLt(score, 10000);
+    }
+
+    /// The score does not depend on any other solver's submission — the whole
+    /// point of an absolute rule.
+    function test_score_is_absolute_not_relative_to_other_plans() public {
+        IAppIntentBase.IntentOrder memory o_first = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_first = _plan(HK_B, 1);
+        vm.prank(relayer);
+        (uint256 first,) = app.scoreIntent(o_first, p_first);
+
+        vm.warp(vault.nextRebalanceAt(112));
+        IAppIntentBase.IntentOrder memory o_second = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_second = _plan(HK_A, 0);
+        vm.prank(relayer);
+        (uint256 second,) = app.scoreIntent(o_second, p_second);
+
+        vm.warp(vault.nextRebalanceAt(112));
+        IAppIntentBase.IntentOrder memory o_third = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_third = _plan(HK_B, 1);
+        vm.prank(relayer);
+        (uint256 third,) = app.scoreIntent(o_third, p_third);
+
+        assertEq(first, third, "an identical plan scored differently after a rival submitted");
+        assertLt(second, first);
+    }
+
+    function test_a_plan_naming_a_non_allowlisted_validator_is_rejected() public {
+        // HK_OUT has the best rate on the whole subnet. It still cannot be chosen:
+        // its take was never vetted, and take is invisible on chain.
+        IAppIntentBase.IntentOrder memory o = _order(112);
+        IAppIntentBase.ExecutionPlan memory p = _plan(HK_OUT, 9);
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(AlphaYieldApp.NotAllowlisted.selector, HK_OUT));
+        app.scoreIntent(o, p);
+    }
+
+    function test_a_dead_subnet_is_declined_rather_than_scored() public {
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 0, true);
+        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 0, true);
+        IAppIntentBase.IntentOrder memory o = _order(112);
+        IAppIntentBase.ExecutionPlan memory p = _plan(HK_B, 1);
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(AlphaYieldApp.NoScorableYield.selector, uint256(112)));
+        app.scoreIntent(o, p);
+    }
+
+    /// Re-affirming the incumbent is a legitimate answer when it is already best.
+    function test_keeping_the_current_validator_scores_full_marks_when_it_is_best() public {
+        // make A the best, so standing pat is correct
+        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 1, true);
+        uint256 cooldownBefore = vault.nextRebalanceAt(112);
+        IAppIntentBase.IntentOrder memory o_score = _order(112);
+        IAppIntentBase.ExecutionPlan memory p_score = _plan(HK_A, 0);
+        vm.prank(relayer);
+        (uint256 score,) = app.scoreIntent(o_score, p_score);
+
+        assertEq(score, 10000, "standing pat on the best validator was penalised");
+        (bytes32 hk,,,,) = vault.markets(112);
+        assertEq(hk, HK_A, "the position moved when it should not have");
+        assertEq(
+            vault.nextRebalanceAt(112), cooldownBefore,
+            "a no-op burned the cooldown, blocking a real move later"
+        );
+    }
+
+    function test_only_the_relayer_may_score() public {
+        IAppIntentBase.IntentOrder memory o = _order(112);
+        IAppIntentBase.ExecutionPlan memory p = _plan(HK_B, 1);
+        vm.expectRevert();
+        app.scoreIntent(o, p); // no prank: caller is the test contract, not the relayer
+    }
+
+    /// survey() is the solver's whole input: candidates, live rates, cooldown.
+    function test_survey_publishes_everything_a_solver_needs() public view {
+        (bytes32[] memory hks, uint16[] memory uids, uint256[] memory rates, uint256 readyAt) =
+            app.survey(112);
+        assertEq(hks.length, 2);
+        assertEq(hks[0], HK_A);
+        assertEq(uids[1], 1);
+        assertGt(rates[1], rates[0], "survey does not reveal which validator is better");
+        assertEq(readyAt, vault.nextRebalanceAt(112));
+    }
+}

@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IStakingV2} from "./interfaces/IStakingV2.sol";
+import {IMetagraph} from "./interfaces/IMetagraph.sol";
 import {WrappedAlpha} from "./WrappedAlpha.sol";
 
 /// ONE contract, ANY subnet, two ways to own the result.
@@ -34,8 +35,29 @@ import {WrappedAlpha} from "./WrappedAlpha.sol";
 /// would stake a billionth of the deposit while accepting all of it.
 contract AlphaVault is ReentrancyGuard {
     IStakingV2 public constant STAKING = IStakingV2(0x0000000000000000000000000000000000000805);
+    IMetagraph public constant METAGRAPH = IMetagraph(0x0000000000000000000000000000000000000802);
 
     uint256 public constant WEI_PER_RAO = 1e9;
+
+    /// Bounded because the optimiser scores by scanning every candidate; an
+    /// unbounded set would make scoring cost grow without limit.
+    uint256 public constant MAX_CANDIDATES = 16;
+
+    /// Adding a validator widens who holders must trust, so it waits. REMOVING
+    /// one is instant — narrowing the set can only ever reduce risk, and a
+    /// validator that turns hostile must be ejectable immediately.
+    uint256 public constant ALLOWLIST_TIMELOCK = 2 days;
+
+    /// Re-delegation is free mechanically, which means nothing stops a hostile
+    /// or buggy optimiser from thrashing the position. This bounds it.
+    uint256 public constant REBALANCE_COOLDOWN = 6 hours;
+
+    /// A performance fee is a claim on holders' yield; cap it in code so no
+    /// governor can quietly raise it to confiscatory levels.
+    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 2000;
+
+    uint256 private constant BPS = 10_000;
+    uint256 private constant PPS_SCALE = 1e18;
 
     /// Sized against attack cost. A donation of D rounds a depositor of `minted`
     /// alpha to zero shares when D > minted * V — and `transferStake` lets ANYONE
@@ -55,17 +77,50 @@ contract AlphaVault is ReentrancyGuard {
 
     struct Market {
         bytes32 hotkey;      // the validator this subnet's wrapped position delegates to
+        uint16 uid;          // that validator's metagraph uid, proved against the chain
         WrappedAlpha token;  // the ERC-20 face; address(0) until opened
+        uint64 lastRebalance;
+        /// Highest alpha-per-share ever seen, 1e18-scaled. The performance fee is
+        /// charged only on growth above this line, so a fall and recovery is not
+        /// billed twice and the fee tracks REALISED yield rather than a forecast.
+        uint256 highWaterPps;
+    }
+
+    struct Candidate {
+        bytes32 hotkey;
+        uint16 uid;
     }
 
     mapping(uint256 => Market) public markets;
 
+    /// The set the optimiser may choose within. This is the load-bearing safety
+    /// boundary: solver-supplied plans are untrusted, and the delegate take that
+    /// determines real payout is NOT readable on chain, so eligibility is vetted
+    /// once here rather than trusted per-plan.
+    mapping(uint256 => Candidate[]) private _candidates;
+    mapping(uint256 => mapping(bytes32 => bool)) public isCandidate;
+    mapping(bytes32 => uint256) public candidateEta;
+
     address public governor;
+
+    /// The only address that may re-delegate. Intended to be the App contract, so
+    /// that re-delegation happens through a scored intent rather than by fiat.
+    address public optimizer;
+
+    address public feeRecipient;
+    uint256 public performanceFeeBps;
 
     event MarketOpened(uint256 indexed netuid, bytes32 hotkey, address token);
     event Purchased(uint256 indexed netuid, bytes32 indexed beneficiary, uint256 taoWei, uint256 alphaOut);
     event PurchasedWrapped(uint256 indexed netuid, address indexed receiver, uint256 taoWei, uint256 alphaMinted, uint256 shares);
     event RedeemedWrapped(uint256 indexed netuid, address indexed who, uint256 shares, uint256 alphaBurned, uint256 taoWei);
+    event CandidateQueued(uint256 indexed netuid, bytes32 hotkey, uint256 eta);
+    event CandidateAdded(uint256 indexed netuid, bytes32 hotkey, uint16 uid);
+    event CandidateRemoved(uint256 indexed netuid, bytes32 hotkey);
+    event Rebalanced(uint256 indexed netuid, bytes32 from, bytes32 to, uint16 uid, uint256 amount);
+    event PerformanceFeeCharged(uint256 indexed netuid, uint256 feeAlpha, uint256 feeShares, uint256 newHighWater);
+    event OptimizerSet(address optimizer);
+    event PerformanceFeeSet(address recipient, uint256 bps);
 
     error DustAmount();
     error UnalignedAmount();
@@ -77,9 +132,27 @@ contract AlphaVault is ReentrancyGuard {
     error NotGovernor();
     error TaoTransferFailed();
     error NoBeneficiary();
+    error NotOptimizer();
+    error NotCandidate();
+    error AlreadyCandidate();
+    error TooManyCandidates();
+    error TimelockPending(uint256 eta);
+    error NotQueued();
+    error UidMismatch(bytes32 wanted, bytes32 got);
+    error RebalanceTooSoon(uint256 readyAt);
+    error AlreadyDelegated();
+    error NothingStaked();
+    error MoveLostAlpha(uint256 sent, uint256 arrived);
+    error FeeTooHigh(uint256 bps);
+    error NoCandidates();
 
     modifier onlyGovernor() {
         if (msg.sender != governor) revert NotGovernor();
+        _;
+    }
+
+    modifier onlyOptimizer() {
+        if (msg.sender != optimizer) revert NotOptimizer();
         _;
     }
 
@@ -94,20 +167,167 @@ contract AlphaVault is ReentrancyGuard {
     /// `purchase` works for any netuid with no setup, because it never holds a
     /// position and so has nothing to account for.
     ///
-    /// The hotkey is fixed here and cannot be changed. All wAlpha<netuid> must be
-    /// backed by ONE position or it is not fungible, and a vault that can move
-    /// its own delegation is one whose holders must trust whoever triggers the
-    /// move. Re-delegation costs nothing mechanically (moveStake preserves alpha
-    /// 1:1, measured on a fork) so this is purely a governance choice, and the
-    /// conservative one is taken until it is deliberately revisited.
-    function openMarket(uint256 netuid, bytes32 hotkey, string calldata name, string calldata symbol)
-        external onlyGovernor returns (address token)
-    {
+    /// `initial` is the candidate set the optimiser may ever choose within;
+    /// index 0 becomes the live delegation. Every entry is proved against the
+    /// metagraph here, so a typo'd uid cannot be admitted and later mis-scored.
+    function openMarket(
+        uint256 netuid,
+        Candidate[] calldata initial,
+        string calldata name,
+        string calldata symbol
+    ) external onlyGovernor returns (address token) {
         if (address(markets[netuid].token) != address(0)) revert MarketAlreadyOpen();
+        if (initial.length == 0) revert NoCandidates();
+        if (initial.length > MAX_CANDIDATES) revert TooManyCandidates();
+
+        for (uint256 i = 0; i < initial.length; ++i) {
+            _proveUid(netuid, initial[i]);
+            if (isCandidate[netuid][initial[i].hotkey]) revert AlreadyCandidate();
+            isCandidate[netuid][initial[i].hotkey] = true;
+            _candidates[netuid].push(initial[i]);
+            emit CandidateAdded(netuid, initial[i].hotkey, initial[i].uid);
+        }
+
         WrappedAlpha t = new WrappedAlpha(netuid, name, symbol);
-        markets[netuid] = Market({hotkey: hotkey, token: t});
-        emit MarketOpened(netuid, hotkey, address(t));
+        markets[netuid] = Market({
+            hotkey: initial[0].hotkey,
+            uid: initial[0].uid,
+            token: t,
+            lastRebalance: uint64(block.timestamp),
+            highWaterPps: 0
+        });
+        emit MarketOpened(netuid, initial[0].hotkey, address(t));
         return address(t);
+    }
+
+    // ── allowlist ────────────────────────────────────────────────────────────
+
+    /// Widening the trusted set waits out a timelock so holders can exit first.
+    function queueCandidate(uint256 netuid, bytes32 hotkey) external onlyGovernor {
+        if (isCandidate[netuid][hotkey]) revert AlreadyCandidate();
+        if (_candidates[netuid].length >= MAX_CANDIDATES) revert TooManyCandidates();
+        uint256 eta = block.timestamp + ALLOWLIST_TIMELOCK;
+        candidateEta[_key(netuid, hotkey)] = eta;
+        emit CandidateQueued(netuid, hotkey, eta);
+    }
+
+    function commitCandidate(uint256 netuid, bytes32 hotkey, uint16 uid) external onlyGovernor {
+        bytes32 k = _key(netuid, hotkey);
+        uint256 eta = candidateEta[k];
+        if (eta == 0) revert NotQueued();
+        if (block.timestamp < eta) revert TimelockPending(eta);
+        if (isCandidate[netuid][hotkey]) revert AlreadyCandidate();
+        if (_candidates[netuid].length >= MAX_CANDIDATES) revert TooManyCandidates();
+
+        Candidate memory c = Candidate({hotkey: hotkey, uid: uid});
+        // Proved at COMMIT, not at queue: uids are reassigned when neurons
+        // deregister, so a check two days stale would be worthless.
+        _proveUid(netuid, c);
+
+        delete candidateEta[k];
+        isCandidate[netuid][hotkey] = true;
+        _candidates[netuid].push(c);
+        emit CandidateAdded(netuid, hotkey, uid);
+    }
+
+    /// No timelock: ejecting a validator can only narrow trust. The live
+    /// delegation cannot be removed out from under the position — move first.
+    function removeCandidate(uint256 netuid, bytes32 hotkey) external onlyGovernor {
+        if (!isCandidate[netuid][hotkey]) revert NotCandidate();
+        if (markets[netuid].hotkey == hotkey) revert AlreadyDelegated();
+
+        Candidate[] storage cs = _candidates[netuid];
+        for (uint256 i = 0; i < cs.length; ++i) {
+            if (cs[i].hotkey == hotkey) {
+                cs[i] = cs[cs.length - 1];
+                cs.pop();
+                break;
+            }
+        }
+        delete isCandidate[netuid][hotkey];
+        emit CandidateRemoved(netuid, hotkey);
+    }
+
+    function candidateCount(uint256 netuid) external view returns (uint256) {
+        return _candidates[netuid].length;
+    }
+
+    function candidateAt(uint256 netuid, uint256 i) external view returns (bytes32 hotkey, uint16 uid) {
+        Candidate memory c = _candidates[netuid][i];
+        return (c.hotkey, c.uid);
+    }
+
+    // ── re-delegation ────────────────────────────────────────────────────────
+
+    function nextRebalanceAt(uint256 netuid) public view returns (uint256) {
+        return uint256(markets[netuid].lastRebalance) + REBALANCE_COOLDOWN;
+    }
+
+    /// Move the whole wrapped position to another allowlisted validator.
+    ///
+    /// Callable ONLY by the optimiser App, so the destination is the output of a
+    /// scored intent. Three things are enforced here rather than trusted: the
+    /// destination is on the allowlist, its uid genuinely maps to that hotkey on
+    /// the metagraph right now, and the alpha that arrives matches what left.
+    /// The plan a solver submits is DATA — this contract never executes
+    /// solver-supplied calls.
+    function rebalance(uint256 netuid, bytes32 toHotkey, uint16 toUid)
+        external onlyOptimizer nonReentrant returns (uint256 moved)
+    {
+        Market storage m = markets[netuid];
+        if (address(m.token) == address(0)) revert MarketNotOpen();
+        if (!isCandidate[netuid][toHotkey]) revert NotCandidate();
+        if (toHotkey == m.hotkey) revert AlreadyDelegated();
+        uint256 ready = nextRebalanceAt(netuid);
+        if (block.timestamp < ready) revert RebalanceTooSoon(ready);
+        _proveUid(netuid, Candidate({hotkey: toHotkey, uid: toUid}));
+
+        // Crystallise the fee against the OLD validator's performance before the
+        // position moves, so a rebalance can never be used to reset the mark.
+        _accrueFee(netuid);
+
+        bytes32 from = m.hotkey;
+        uint256 amount = STAKING.getStake(from, coldkey, netuid);
+        if (amount == 0) revert NothingStaked();
+
+        uint256 before = STAKING.getStake(toHotkey, coldkey, netuid);
+        // Same netuid on both sides — a delegation move, never a pool crossing.
+        STAKING.moveStake(from, toHotkey, netuid, netuid, amount);
+        moved = STAKING.getStake(toHotkey, coldkey, netuid) - before;
+        // Measured, not assumed. A fork run showed same-netuid moves preserve
+        // alpha exactly; anything less than that here is a silent haircut on
+        // every holder, so it reverts rather than repricing the shares.
+        if (moved < amount) revert MoveLostAlpha(amount, moved);
+
+        m.hotkey = toHotkey;
+        m.uid = toUid;
+        m.lastRebalance = uint64(block.timestamp);
+        emit Rebalanced(netuid, from, toHotkey, toUid, moved);
+    }
+
+    /// Crystallise any fee owed. Permissionless on purpose: it can only ever
+    /// charge growth that already happened, and letting anyone call it means the
+    /// mark cannot drift far from reality between deposits.
+    function accrue(uint256 netuid) external nonReentrant {
+        _accrueFee(netuid);
+    }
+
+    // ── governance ───────────────────────────────────────────────────────────
+
+    function setOptimizer(address o) external onlyGovernor {
+        optimizer = o;
+        emit OptimizerSet(o);
+    }
+
+    /// The fee is charged on realised share-price growth. That is deliberate:
+    /// the delegate take is not readable on chain, so a plan CAN route to a
+    /// validator that keeps everything. Billing on what holders actually earned
+    /// makes such a plan worth zero to the fee recipient too.
+    function setPerformanceFee(address recipient, uint256 bps) external onlyGovernor {
+        if (bps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh(bps);
+        feeRecipient = recipient;
+        performanceFeeBps = bps;
+        emit PerformanceFeeSet(recipient, bps);
     }
 
     function setGovernor(address g) external onlyGovernor { governor = g; }
@@ -127,6 +347,14 @@ contract AlphaVault is ReentrancyGuard {
     function totalShares(uint256 netuid) public view returns (uint256) {
         Market memory m = markets[netuid];
         return address(m.token) == address(0) ? 0 : m.token.totalSupply();
+    }
+
+    /// Alpha backing one share, 1e18-scaled. This is the only thing the fee is
+    /// measured against — it rises with yield and with nothing else, because a
+    /// deposit adds alpha and shares in the same ratio.
+    function pricePerShare(uint256 netuid) public view returns (uint256) {
+        return ((positionAlpha(netuid) + VIRTUAL_ALPHA) * PPS_SCALE)
+            / (totalShares(netuid) + VIRTUAL_SHARES);
     }
 
     function convertToAlpha(uint256 netuid, uint256 shares) public view returns (uint256) {
@@ -172,9 +400,13 @@ contract AlphaVault is ReentrancyGuard {
     function purchaseWrapped(uint256 netuid, address receiver, uint256 minSharesOut)
         external payable nonReentrant returns (uint256 shares)
     {
-        Market memory m = markets[netuid];
-        if (address(m.token) == address(0)) revert MarketNotOpen();
+        if (address(markets[netuid].token) == address(0)) revert MarketNotOpen();
         uint256 rao = _toRao(msg.value);
+
+        // Before ANY measurement: yield earned up to now belongs to existing
+        // holders and the fee recipient, not to the incoming deposit.
+        _accrueFee(netuid);
+        Market memory m = markets[netuid];
 
         uint256 alphaBefore = STAKING.getStake(m.hotkey, coldkey, netuid);
         uint256 supplyBefore = m.token.totalSupply();
@@ -198,9 +430,13 @@ contract AlphaVault is ReentrancyGuard {
     function redeemWrapped(uint256 netuid, uint256 shares, uint256 minTaoOutWei)
         external nonReentrant returns (uint256 taoOutWei)
     {
-        Market memory m = markets[netuid];
-        if (address(m.token) == address(0)) revert MarketNotOpen();
+        if (address(markets[netuid].token) == address(0)) revert MarketNotOpen();
         if (shares == 0) revert ZeroShares();
+
+        // Settle the fee first so the redeemer cannot exit ahead of a fee that
+        // their own holding period earned.
+        _accrueFee(netuid);
+        Market memory m = markets[netuid];
 
         uint256 alphaOut = convertToAlpha(netuid, shares);
         if (alphaOut == 0) revert ZeroShares();
@@ -220,6 +456,68 @@ contract AlphaVault is ReentrancyGuard {
     }
 
     // ── internals ────────────────────────────────────────────────────────────
+
+    function _key(uint256 netuid, bytes32 hotkey) private pure returns (bytes32) {
+        return keccak256(abi.encodePacked(netuid, hotkey));
+    }
+
+    /// A uid is a slot, not an identity — neurons deregister and slots are
+    /// reused. Every place a uid is accepted it is proved against the metagraph
+    /// in the same transaction, so scoring can trust the pairing.
+    function _proveUid(uint256 netuid, Candidate memory c) private view {
+        bytes32 onChain = METAGRAPH.getHotkey(uint16(netuid), c.uid);
+        if (onChain != c.hotkey) revert UidMismatch(c.hotkey, onChain);
+    }
+
+    /// Charge the performance fee on growth above the high-water mark, as share
+    /// dilution rather than as a withdrawal — the vault never has loose alpha to
+    /// send, and diluting is how a share-price vault expresses a fee.
+    ///
+    /// Nothing here can charge on a deposit: pricePerShare is invariant to
+    /// deposits by construction, so the mark only moves when the position grows
+    /// without shares growing, which is exactly yield.
+    function _accrueFee(uint256 netuid) internal {
+        Market storage m = markets[netuid];
+        if (address(m.token) == address(0)) return;
+
+        uint256 pps = pricePerShare(netuid);
+        uint256 hwm = m.highWaterPps;
+        if (pps <= hwm) return;
+
+        uint256 supply = m.token.totalSupply();
+        uint256 bps = performanceFeeBps;
+        address to = feeRecipient;
+        // Mark still advances when the fee is off or there is nobody to bill:
+        // otherwise switching the fee on would retroactively charge for growth
+        // that accrued while it was off.
+        if (supply == 0 || bps == 0 || to == address(0)) {
+            m.highWaterPps = pps;
+            return;
+        }
+
+        uint256 gainAlpha = ((pps - hwm) * supply) / PPS_SCALE;
+        uint256 feeAlpha = (gainAlpha * bps) / BPS;
+        if (feeAlpha == 0) {
+            m.highWaterPps = pps;
+            return;
+        }
+
+        uint256 assets = positionAlpha(netuid) + VIRTUAL_ALPHA;
+        if (feeAlpha >= assets) return; // pathological; leave the mark, charge nothing
+
+        // Shares whose post-mint value equals feeAlpha, so the charge lands on
+        // existing holders exactly once.
+        uint256 feeShares = (feeAlpha * (supply + VIRTUAL_SHARES)) / (assets - feeAlpha);
+        if (feeShares == 0) {
+            m.highWaterPps = pps;
+            return;
+        }
+
+        m.token.mint(to, feeShares);
+        uint256 newPps = pricePerShare(netuid);
+        m.highWaterPps = newPps;
+        emit PerformanceFeeCharged(netuid, feeAlpha, feeShares, newPps);
+    }
 
     function _toRao(uint256 weiAmount) private pure returns (uint256 rao) {
         rao = weiAmount / WEI_PER_RAO;
