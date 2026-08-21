@@ -358,6 +358,36 @@ contract AlphaVaultRebalanceTest is Test {
         vault.rebalance(112, HK_A, 0); // now allowed
     }
 
+    /// The rounding the real chain actually does must NOT trip the guard —
+    /// a strict equality check here made rebalancing impossible on Finney.
+    function test_one_rao_of_rounding_dust_is_tolerated() public {
+        _deposit(ONE_TAO);
+        uint256 before = _position();
+        staking.setMoveDust(1); // exactly what a Finney fork run loses
+
+        vm.prank(opt);
+        uint256 moved = vault.rebalance(112, HK_B, 1);
+        assertEq(moved, before - 1, "fixture did not reproduce the rounding");
+        (bytes32 hk,,,,) = vault.markets(112);
+        assertEq(hk, HK_B, "a one-rao rounding blocked the move");
+    }
+
+    function test_a_move_losing_more_than_dust_still_reverts() public {
+        _deposit(ONE_TAO);
+        uint256 before = _position();
+        // Resolve every external read BEFORE pranking — a call inside the
+        // expectRevert argument consumes the prank and the test then fails (or
+        // passes) for the wrong reason.
+        uint256 tooMuch = vault.MAX_MOVE_DUST() + 1;
+        staking.setMoveDust(tooMuch);
+
+        vm.prank(opt);
+        vm.expectRevert(
+            abi.encodeWithSelector(AlphaVault.MoveLostAlpha.selector, before, before - tooMuch)
+        );
+        vault.rebalance(112, HK_B, 1);
+    }
+
     function test_a_lossy_move_reverts_instead_of_repricing_shares() public {
         _deposit(ONE_TAO);
         uint256 before = _position();

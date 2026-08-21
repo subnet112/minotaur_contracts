@@ -78,13 +78,18 @@ contract MockStakingV2 {
     uint256 public moveLossBps;
     function setMoveLossBps(uint256 b) external { moveLossBps = b; }
 
+    /// The real extrinsic arrives exactly ONE rao short — integer rounding, and
+    /// fork-measured identical at 1 TAO and 25 TAO. Absolute, not proportional.
+    uint256 public moveDust;
+    function setMoveDust(uint256 d) external { moveDust = d; }
+
     function moveStake(bytes32 fromHk, bytes32 toHk, uint256 srcNid, uint256 dstNid, uint256 amount)
         external payable
     {
         bytes32 ck = coldkeyOf[msg.sender];
         require(stake[ck][fromHk][srcNid] >= amount, "exceeds stake");
         stake[ck][fromHk][srcNid] -= amount;
-        stake[ck][toHk][dstNid] += amount - (amount * moveLossBps) / 10_000;
+        stake[ck][toHk][dstNid] += amount - (amount * moveLossBps) / 10_000 - moveDust;
     }
 
     receive() external payable {}

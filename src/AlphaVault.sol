@@ -79,6 +79,23 @@ contract AlphaVault is ReentrancyGuard {
     /// governor can quietly raise it to confiscatory levels.
     uint256 public constant MAX_PERFORMANCE_FEE_BPS = 2000;
 
+    /// `moveStake` arrives ONE rao short of what left. Measured on a Finney fork
+    /// at 1 TAO and again at 25 TAO — identical single-unit loss both times, so
+    /// it is integer-division rounding inside the extrinsic and does NOT scale
+    /// with the position.
+    ///
+    /// This tolerance is ABSOLUTE for that reason. An earlier probe reported the
+    /// move as "0.0000% loss" and a strict `moved < amount` check was written
+    /// against that reading — but four decimal places cannot tell exactly
+    /// lossless from off-by-one, and the strict check made rebalancing
+    /// impossible on the real chain. A percentage bound would have hidden the
+    /// same thing again.
+    ///
+    /// 1000 is ~1000x the observed rounding and still ~2000x TIGHTER than one
+    /// basis point of a single-TAO position (445.8e9 rao), so a haircut that
+    /// actually costs holders anything cannot hide underneath it.
+    uint256 public constant MAX_MOVE_DUST = 1000;
+
     uint256 private constant BPS = 10_000;
     uint256 private constant PPS_SCALE = 1e18;
 
@@ -332,10 +349,10 @@ contract AlphaVault is ReentrancyGuard {
         // Same netuid on both sides — a delegation move, never a pool crossing.
         STAKING.moveStake(from, toHotkey, netuid, netuid, amount);
         moved = STAKING.getStake(toHotkey, coldkey, netuid) - before;
-        // Measured, not assumed. A fork run showed same-netuid moves preserve
-        // alpha exactly; anything less than that here is a silent haircut on
-        // every holder, so it reverts rather than repricing the shares.
-        if (moved < amount) revert MoveLostAlpha(amount, moved);
+        // Measured, not assumed. Same-netuid moves lose exactly one rao to
+        // rounding; anything beyond MAX_MOVE_DUST is a real haircut on every
+        // holder, so it reverts rather than silently repricing the shares.
+        if (moved + MAX_MOVE_DUST < amount) revert MoveLostAlpha(amount, moved);
 
         m.hotkey = toHotkey;
         m.uid = toUid;
