@@ -96,11 +96,19 @@ const manifest = {
       /**
        * Perpetual: the subnet re-opens this order after every fill while
        * execution_count < max_executions, so Minotaur decides WHEN to move the
-       * stake. `cooldown` must be >= AlphaVault.REBALANCE_COOLDOWN (6h) or the
-       * vault reverts the fill with RebalanceTooSoon.
+       * stake.
+       *
+       * Do not hardcode the cooldown — read `AlphaVault.rebalanceCooldown()` and
+       * build the order's `cooldown` from it. The two are NOT redundant: the
+       * base's clock is keyed on order.orderId (how often may this ORDER fill),
+       * the vault's on the netuid (how often may this MARKET move). A second
+       * order aimed at the same market carries its own base clock, and
+       * scoreIntent reaches the vault with no base checks at all. Setting the
+       * order shorter than the vault's just reverts fills with RebalanceTooSoon.
        */
       perpetual: true,
-      min_cooldown_seconds: 21600,
+      cooldown_source: "AlphaVault.rebalanceCooldown()",
+      min_cooldown_seconds: 3600,
     },
   ],
 };

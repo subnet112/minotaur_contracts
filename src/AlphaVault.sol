@@ -48,9 +48,32 @@ contract AlphaVault is ReentrancyGuard {
     /// validator that turns hostile must be ejectable immediately.
     uint256 public constant ALLOWLIST_TIMELOCK = 2 days;
 
-    /// Re-delegation is free mechanically, which means nothing stops a hostile
-    /// or buggy optimiser from thrashing the position. This bounds it.
-    uint256 public constant REBALANCE_COOLDOWN = 6 hours;
+    /// Floor under the configurable cooldown. Re-delegation is free
+    /// mechanically, so nothing but a clock stops a hostile or buggy optimiser
+    /// from thrashing the position.
+    ///
+    /// WHY THIS EXISTS ALONGSIDE AppIntentBase's ORDER COOLDOWN, rather than
+    /// deferring to it — they are not the same guarantee:
+    ///
+    ///   * The base's cooldown is keyed on `order.orderId` and answers "how
+    ///     often may THIS ORDER fill?". A second perpetual order aimed at the
+    ///     same market carries its own independent clock, and both could fill
+    ///     back to back. This one is keyed on the NETUID and answers "how often
+    ///     may THIS MARKET's position move?" — an invariant of the asset, which
+    ///     is what holders actually need.
+    ///   * `order.cooldown` is a user-signed field chosen by whoever creates the
+    ///     order, not a protocol constant.
+    ///   * The base checks it in `executeIntent` only. `scoreIntent` reaches
+    ///     `_handleIntent` — and therefore `rebalance` — with none of the
+    ///     replay, deadline or cooldown checks applied. It is meant to run
+    ///     against a fork, but it is a real function on a real contract, and
+    ///     this is the only thing bounding what a stray call to it can do.
+    ///
+    /// So the order cooldown paces the intent, and this paces the position. Set
+    /// them to the same value at deploy; `nextRebalanceAt` is public so the
+    /// order can be built from it rather than duplicating the number by hand.
+    uint256 public constant MIN_REBALANCE_COOLDOWN = 1 hours;
+    uint256 public constant DEFAULT_REBALANCE_COOLDOWN = 6 hours;
 
     /// A performance fee is a claim on holders' yield; cap it in code so no
     /// governor can quietly raise it to confiscatory levels.
@@ -110,6 +133,10 @@ contract AlphaVault is ReentrancyGuard {
     address public feeRecipient;
     uint256 public performanceFeeBps;
 
+    /// Configurable so a deployment sets ONE number that the perpetual order's
+    /// `cooldown` is then derived from, instead of two constants drifting apart.
+    uint256 public rebalanceCooldown;
+
     event MarketOpened(uint256 indexed netuid, bytes32 hotkey, address token);
     event Purchased(uint256 indexed netuid, bytes32 indexed beneficiary, uint256 taoWei, uint256 alphaOut);
     event PurchasedWrapped(uint256 indexed netuid, address indexed receiver, uint256 taoWei, uint256 alphaMinted, uint256 shares);
@@ -121,6 +148,7 @@ contract AlphaVault is ReentrancyGuard {
     event PerformanceFeeCharged(uint256 indexed netuid, uint256 feeAlpha, uint256 feeShares, uint256 newHighWater);
     event OptimizerSet(address optimizer);
     event PerformanceFeeSet(address recipient, uint256 bps);
+    event RebalanceCooldownSet(uint256 seconds_);
 
     error DustAmount();
     error UnalignedAmount();
@@ -145,6 +173,7 @@ contract AlphaVault is ReentrancyGuard {
     error MoveLostAlpha(uint256 sent, uint256 arrived);
     error FeeTooHigh(uint256 bps);
     error NoCandidates();
+    error CooldownTooShort(uint256 given, uint256 floor);
 
     modifier onlyGovernor() {
         if (msg.sender != governor) revert NotGovernor();
@@ -159,6 +188,7 @@ contract AlphaVault is ReentrancyGuard {
     constructor(bytes32 _coldkey, address _governor) {
         coldkey = _coldkey;
         governor = _governor;
+        rebalanceCooldown = DEFAULT_REBALANCE_COOLDOWN;
     }
 
     // ── markets ──────────────────────────────────────────────────────────────
@@ -260,7 +290,15 @@ contract AlphaVault is ReentrancyGuard {
     // ── re-delegation ────────────────────────────────────────────────────────
 
     function nextRebalanceAt(uint256 netuid) public view returns (uint256) {
-        return uint256(markets[netuid].lastRebalance) + REBALANCE_COOLDOWN;
+        return uint256(markets[netuid].lastRebalance) + rebalanceCooldown;
+    }
+
+    /// Build the perpetual order's `cooldown` from this, so the two clocks are
+    /// configured once rather than asserted to match.
+    function setRebalanceCooldown(uint256 seconds_) external onlyGovernor {
+        if (seconds_ < MIN_REBALANCE_COOLDOWN) revert CooldownTooShort(seconds_, MIN_REBALANCE_COOLDOWN);
+        rebalanceCooldown = seconds_;
+        emit RebalanceCooldownSet(seconds_);
     }
 
     /// Move the whole wrapped position to another allowlisted validator.

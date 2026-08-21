@@ -501,3 +501,92 @@ contract AlphaVaultRebalanceTest is Test {
         t = address(w);
     }
 }
+
+/// The vault's cooldown is not a duplicate of AppIntentBase's order cooldown.
+/// The base keys its clock on order.orderId; this one keys on the netuid, so it
+/// still binds when a SECOND order targets the same market — and when the
+/// scoreIntent path reaches rebalance with none of the base's checks applied.
+contract AlphaVaultCooldownTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+
+    bytes32 constant HK_A = bytes32(uint256(0xAA));
+    bytes32 constant HK_B = bytes32(uint256(0xBB));
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+
+    address gov = address(0x600D);
+    address opt = address(0x0971);
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 15000, true);
+        meta.setNeuron(112, 1, HK_B, 100_000_000_000, 35000, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+        staking.setExitFeeBps(10);
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_A, uid: 0});
+        cs[1] = AlphaVault.Candidate({hotkey: HK_B, uid: 1});
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "w", "w");
+        vault.setOptimizer(opt);
+        vm.stopPrank();
+
+        vm.deal(address(staking), 1_000_000 ether);
+        vm.deal(address(this), 10 ether);
+        vm.warp(block.timestamp + 30 days);
+        vault.purchaseWrapped{value: 1e18}(112, address(this), 0);
+    }
+
+    function test_the_default_matches_the_documented_six_hours() public view {
+        assertEq(vault.rebalanceCooldown(), 6 hours);
+        assertEq(vault.DEFAULT_REBALANCE_COOLDOWN(), 6 hours);
+    }
+
+    /// One number at deploy, which the perpetual order's cooldown is built from.
+    function test_governor_sets_one_cooldown_that_the_order_is_derived_from() public {
+        vm.prank(gov);
+        vault.setRebalanceCooldown(12 hours);
+        assertEq(vault.rebalanceCooldown(), 12 hours);
+
+        vm.prank(opt);
+        vault.rebalance(112, HK_B, 1);
+        assertEq(
+            vault.nextRebalanceAt(112), block.timestamp + 12 hours,
+            "nextRebalanceAt is not the single source the order should read"
+        );
+    }
+
+    function test_the_cooldown_cannot_be_set_below_the_floor() public {
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(AlphaVault.CooldownTooShort.selector, 59 minutes, uint256(1 hours))
+        );
+        vault.setRebalanceCooldown(59 minutes);
+    }
+
+    function test_only_the_governor_sets_it() public {
+        vm.prank(opt);
+        vm.expectRevert(AlphaVault.NotGovernor.selector);
+        vault.setRebalanceCooldown(12 hours);
+    }
+
+    /// The case the base's per-order clock cannot cover: a caller that never
+    /// went through executeIntent at all still cannot move the position twice.
+    function test_it_binds_a_caller_that_bypassed_the_order_entirely() public {
+        vm.prank(opt);
+        vault.rebalance(112, HK_B, 1);
+
+        uint256 readyAt = vault.nextRebalanceAt(112);
+        vm.prank(opt);
+        vm.expectRevert(abi.encodeWithSelector(AlphaVault.RebalanceTooSoon.selector, readyAt));
+        vault.rebalance(112, HK_A, 0);
+    }
+}
