@@ -620,3 +620,120 @@ contract AlphaVaultCooldownTest is Test {
         vault.rebalance(112, HK_A, 0);
     }
 }
+
+/// Can the allowlist actually be maintained after launch?
+///
+/// Adding waits a 2-day timelock; removing is instant. But the LIVE delegation
+/// cannot be removed, and the intent only re-delegates to a candidate that
+/// clears scoreThreshold. On SN112 at launch nothing else does — uid 230, the
+/// best alternative, reaches 4099 BPS against a 5000 gate — so the incumbent is
+/// unremovable through the intent alone. This is the documented way out, tested
+/// because an untested recovery procedure is not a recovery procedure.
+contract AlphaVaultAllowlistLifecycleTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+
+    bytes32 constant HK_0 = bytes32(uint256(0xAA));   // incumbent, dominant
+    bytes32 constant HK_41 = bytes32(uint256(0xBB));  // inert second candidate
+    bytes32 constant HK_NEW = bytes32(uint256(0xCC)); // a later addition
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+
+    address gov = address(0x600D);
+    address app = address(0x0971);   // the optimizer in normal operation
+    address ops = address(0x0B5);
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+        meta.setNeuron(112, 0, HK_0, 672_893_522_735, 53111, true);
+        meta.setNeuron(112, 41, HK_41, 1_442_603_990_173_928, 224, true);
+        meta.setNeuron(112, 7, HK_NEW, 100_000_000_000, 40000, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+        staking.setExitFeeBps(10);
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_0, uid: 0});
+        cs[1] = AlphaVault.Candidate({hotkey: HK_41, uid: 41});
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "Wrapped SN112 Alpha", "wAlpha112");
+        vault.setOptimizer(app);
+        vm.stopPrank();
+
+        vm.deal(address(staking), 1_000_000 ether);
+        vm.deal(address(this), 10 ether);
+        vm.warp(block.timestamp + 30 days);
+        vault.purchaseWrapped{value: 1e18}(112, address(this), 0);
+    }
+
+    function test_the_allowlist_can_be_grown_after_launch() public {
+        assertEq(vault.candidateCount(112), 2);
+        vm.prank(gov);
+        vault.queueCandidate(112, HK_NEW);
+        vm.warp(block.timestamp + vault.ALLOWLIST_TIMELOCK());
+        vm.prank(gov);
+        vault.commitCandidate(112, HK_NEW, 7);
+        assertEq(vault.candidateCount(112), 3);
+        assertTrue(vault.isCandidate(112, HK_NEW));
+    }
+
+    function test_a_candidate_that_is_not_live_can_be_dropped_instantly() public {
+        vm.prank(gov);
+        vault.removeCandidate(112, HK_41);
+        assertFalse(vault.isCandidate(112, HK_41));
+        assertEq(vault.candidateCount(112), 1);
+    }
+
+    /// The recovery path if the incumbent has to go and no allowlisted candidate
+    /// can win the intent: the governor points the optimizer at an operator
+    /// address, moves the position by hand, drops the old validator, and hands
+    /// the optimizer back. All four steps are governor-gated and the destination
+    /// still has to be on the allowlist.
+    function test_a_stuck_incumbent_can_still_be_evicted_by_governance() public {
+        (bytes32 live,,,,) = vault.markets(112);
+        assertEq(live, HK_0);
+
+        // the normal path is closed: the live one cannot be removed
+        vm.prank(gov);
+        vm.expectRevert(AlphaVault.AlreadyDelegated.selector);
+        vault.removeCandidate(112, HK_0);
+
+        // escape hatch
+        vm.prank(gov);
+        vault.setOptimizer(ops);
+
+        uint256 before = vault.positionAlpha(112);
+        vm.prank(ops);
+        uint256 moved = vault.rebalance(112, HK_41, 41);
+        assertEq(moved, before, "position did not survive the manual move");
+
+        vm.prank(gov);
+        vault.removeCandidate(112, HK_0);
+        assertFalse(vault.isCandidate(112, HK_0), "the bad validator is still eligible");
+
+        vm.prank(gov);
+        vault.setOptimizer(app);
+        assertEq(vault.optimizer(), app, "optimizer not handed back");
+
+        (bytes32 nowLive,,,,) = vault.markets(112);
+        assertEq(nowLive, HK_41, "position not re-delegated");
+    }
+
+    /// Even the escape hatch cannot send the position somewhere unvetted.
+    function test_the_escape_hatch_still_respects_the_allowlist() public {
+        vm.prank(gov);
+        vault.setOptimizer(ops);
+        vm.prank(ops);
+        vm.expectRevert(AlphaVault.NotCandidate.selector);
+        vault.rebalance(112, bytes32(uint256(0xDEAD)), 9);
+    }
+
+    function test_the_allowlist_is_bounded() public {
+        assertEq(vault.MAX_CANDIDATES(), 16);
+    }
+}
