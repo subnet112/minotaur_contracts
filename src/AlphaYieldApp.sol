@@ -92,6 +92,7 @@ contract AlphaYieldApp is AppIntentBaseV2 {
     error NotAllowlisted(bytes32 hotkey);
     error NoScorableYield(uint256 netuid);
     error NothingToOptimize(uint256 netuid, uint256 candidates);
+    error NothingAtStake(uint256 netuid);
 
     constructor(
         address _vault,
@@ -233,6 +234,14 @@ contract AlphaYieldApp is AppIntentBaseV2 {
         uint256 candidates = vault.candidateCount(netuid);
         if (candidates < 2) revert NothingToOptimize(netuid, candidates);
 
+        // An empty vault has nothing to delegate, so a "choice" of validator
+        // decides nothing. Scoring it pays full marks for a no-op every round —
+        // the same unearned-marks shape as a one-candidate market, and easy to
+        // hit for real, because a freshly deployed market holds no position
+        // until its first depositor arrives. Decline rather than reward it.
+        uint256 position = vault.positionAlpha(netuid);
+        if (position == 0) revert NothingAtStake(netuid);
+
         (, , uint256 bestRate, uint256 worstRate) = candidateRange(netuid);
         // No validator on the allowlist is earning anything: there is no better
         // and no worse, so there is nothing to score. Fail rather than hand out
@@ -240,7 +249,7 @@ contract AlphaYieldApp is AppIntentBaseV2 {
         if (bestRate == 0) revert NoScorableYield(netuid);
 
         (bytes32 current, uint16 incumbent, , ,) = vault.markets(netuid);
-        uint256 chosenRate = _rate(netuid, uid, vault.positionAlpha(netuid), incumbent);
+        uint256 chosenRate = _rate(netuid, uid, position, incumbent);
 
         // SCORE BEFORE MOVING. Min-max across the allowlist: worst eligible pick
         // 0, best 1. When every candidate is identical there is no spread to

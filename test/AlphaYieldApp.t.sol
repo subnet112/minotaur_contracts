@@ -393,3 +393,80 @@ contract AlphaYieldThresholdGateTest is Test {
         assertEq(hk, HK_BAD, "a passing plan failed to move the position");
     }
 }
+
+/// A freshly deployed market holds no position until its first depositor. The
+/// validator choice decides nothing in that state, so it must not be scoreable —
+/// otherwise every round pays full marks for a no-op over an empty vault.
+contract AlphaYieldEmptyVaultTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+    AlphaYieldApp app;
+
+    bytes32 constant HK_A = bytes32(uint256(0xAA));
+    bytes32 constant HK_B = bytes32(uint256(0xBB));
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+    address gov = address(0x600D);
+    address relayer = address(0xC0FFEE);
+    bytes4 sel;
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+        // Mirrors the deployed SN112 market: the incumbent dominates and the
+        // second candidate is inert, so naming the incumbent is both the right
+        // answer and a no-op.
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 15000, true);
+        meta.setNeuron(112, 1, HK_B, 1_442_603_990_173_928, 224, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+
+        app = new AlphaYieldApp(
+            address(vault), relayer, address(0x9E61), 5000,
+            address(0xA7A0), address(0), 0, 0, AppIntentBaseV2.FeeMode.APP, address(0), address(0)
+        );
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_A, uid: 0});
+        cs[1] = AlphaVault.Candidate({hotkey: HK_B, uid: 1});
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "w", "w");
+        vault.setOptimizer(address(app));
+        vm.stopPrank();
+
+        sel = app.OPTIMIZE_YIELD();
+        vm.deal(address(staking), 1_000_000 ether);
+        vm.deal(address(this), 10 ether);
+    }
+
+    function _call(bytes32 hk, uint16 uid) internal returns (uint256 score) {
+        IAppIntentBase.IntentOrder memory o;
+        o.orderId = keccak256("o");
+        o.app = address(app);
+        o.intentSelector = sel;
+        o.intentParams = abi.encode(uint256(112));
+        o.chainId = block.chainid;
+        o.deadline = block.timestamp + 1 hours;
+        IAppIntentBase.ExecutionPlan memory p;
+        p.calls = new IAppIntentBase.Call[](0);
+        p.metadata = abi.encode(hk, uid);
+        vm.prank(relayer);
+        (score,) = app.scoreIntent(o, p);
+    }
+
+    function test_an_empty_vault_is_not_scoreable() public {
+        assertEq(vault.positionAlpha(112), 0, "fixture: vault should be empty");
+        vm.expectRevert(abi.encodeWithSelector(AlphaYieldApp.NothingAtStake.selector, uint256(112)));
+        _call(HK_A, 0);
+    }
+
+    function test_it_becomes_scoreable_once_someone_deposits() public {
+        vault.purchaseWrapped{value: 1e18}(112, address(this), 0);
+        assertGt(vault.positionAlpha(112), 0);
+        assertEq(_call(HK_A, 0), 10000, "should score normally once funded");
+    }
+}
