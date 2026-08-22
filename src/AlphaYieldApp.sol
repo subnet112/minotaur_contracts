@@ -241,23 +241,34 @@ contract AlphaYieldApp is AppIntentBaseV2 {
 
         (bytes32 current, uint16 incumbent, , ,) = vault.markets(netuid);
         uint256 chosenRate = _rate(netuid, uid, vault.positionAlpha(netuid), incumbent);
+
+        // SCORE BEFORE MOVING. Min-max across the allowlist: worst eligible pick
+        // 0, best 1. When every candidate is identical there is no spread to
+        // grade on and any pick is the right one, so it scores full marks rather
+        // than dividing by zero.
+        score = bestRate == worstRate
+            ? BPS
+            : ((chosenRate - worstRate) * BPS) / (bestRate - worstRate);
+        if (score > BPS) score = BPS; // worstRate <= chosenRate <= bestRate
+        valid = true;
+
+        // Only act on a plan good enough to be executed.
+        //
+        // The obvious ordering — move, then score — is safe ONLY on the
+        // executeIntent path, where the base reverts the whole transaction if
+        // the score misses scoreThreshold. `scoreIntent` applies no such check:
+        // it calls straight through to here and returns. So moving first means a
+        // single scoreIntent call naming a bad validator relocates a real,
+        // pooled position and simply reports 0, with nothing to undo it.
+        // Scoring first makes the threshold bind on BOTH paths.
         bool moved;
-        if (chosen != current) {
+        if (chosen != current && score >= scoreThreshold) {
             // Reverts if the uid no longer maps to this hotkey, if the cooldown
             // has not elapsed, or if the move would lose alpha. All three are
             // conditions a solver can read in advance via `survey`.
             vault.rebalance(netuid, chosen, uid);
             moved = true;
         }
-
-        // Min-max across the allowlist: worst eligible pick 0, best 1. When every
-        // candidate is identical there is no spread to grade on and any pick is
-        // the right one, so it scores full marks rather than dividing by zero.
-        score = bestRate == worstRate
-            ? BPS
-            : ((chosenRate - worstRate) * BPS) / (bestRate - worstRate);
-        if (score > BPS) score = BPS; // worstRate <= chosenRate <= bestRate
-        valid = true;
 
         emit YieldOptimized(netuid, chosen, uid, chosenRate, bestRate, moved);
     }

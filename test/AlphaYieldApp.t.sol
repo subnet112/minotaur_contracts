@@ -310,3 +310,86 @@ contract AlphaYieldSingleCandidateTest is Test {
         app.scoreIntent(o, p);
     }
 }
+
+/// scoreIntent applies no score threshold — it calls _handleIntent and returns.
+/// So the App must not act on a plan before knowing it is good enough, or a
+/// single scoreIntent call can relocate a pooled position to a bad validator.
+contract AlphaYieldThresholdGateTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+    AlphaYieldApp app;
+
+    bytes32 constant HK_GOOD = bytes32(uint256(0xAA));
+    bytes32 constant HK_BAD = bytes32(uint256(0xBB));
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+    address gov = address(0x600D);
+    address relayer = address(0xC0FFEE);
+    bytes4 sel;
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+        // SN112's real shape: uid0 dominant, the runner-up scoring ~4099 BPS,
+        // i.e. below the 5000 gate. Naming it must not move anything.
+        meta.setNeuron(112, 0, HK_GOOD, 672_893_522_735, 53111, true);
+        meta.setNeuron(112, 1, HK_BAD, 8_800_003, 8659, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+
+        app = new AlphaYieldApp(
+            address(vault), relayer, address(0x9E61), 5000,
+            address(0xA7A0), address(0), 0, 0, AppIntentBaseV2.FeeMode.APP, address(0), address(0)
+        );
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_GOOD, uid: 0});
+        cs[1] = AlphaVault.Candidate({hotkey: HK_BAD, uid: 1});
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "w", "w");
+        vault.setOptimizer(address(app));
+        vm.stopPrank();
+
+        sel = app.OPTIMIZE_YIELD();
+        vm.deal(address(staking), 1_000_000 ether);
+        vm.deal(address(this), 10 ether);
+        vault.purchaseWrapped{value: 1e18}(112, address(this), 0);
+        vm.warp(block.timestamp + 30 days);
+    }
+
+    function _run(bytes32 hk, uint16 uid) internal returns (uint256 score) {
+        IAppIntentBase.IntentOrder memory o;
+        o.orderId = keccak256("o");
+        o.app = address(app);
+        o.intentSelector = sel;
+        o.intentParams = abi.encode(uint256(112));
+        o.chainId = block.chainid;
+        o.deadline = block.timestamp + 1 hours;
+        IAppIntentBase.ExecutionPlan memory p;
+        p.calls = new IAppIntentBase.Call[](0);
+        p.metadata = abi.encode(hk, uid);
+        vm.prank(relayer);
+        (score,) = app.scoreIntent(o, p);
+    }
+
+    function test_a_sub_threshold_plan_scores_low_and_moves_nothing() public {
+        uint256 score = _run(HK_BAD, 1);
+        assertLt(score, 5000, "fixture wrong: the bad validator should be below the gate");
+        (bytes32 hk,,,,) = vault.markets(112);
+        assertEq(hk, HK_GOOD, "a sub-threshold plan relocated the position via scoreIntent");
+        assertEq(staking.getStake(HK_BAD, VAULT_CK, 112), 0, "stake leaked to the bad validator");
+    }
+
+    function test_a_passing_plan_still_moves() public {
+        // flip the fixture so the other validator is genuinely better
+        meta.setNeuron(112, 1, HK_BAD, 100_000_000_000, 60000, true);
+        uint256 score = _run(HK_BAD, 1);
+        assertEq(score, 10000);
+        (bytes32 hk,,,,) = vault.markets(112);
+        assertEq(hk, HK_BAD, "a passing plan failed to move the position");
+    }
+}
