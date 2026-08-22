@@ -10,10 +10,13 @@ import {IMetagraph} from "../src/interfaces/IMetagraph.sol";
 /// Deploy AlphaVault + AlphaYieldApp on Bittensor EVM (964).
 ///
 /// THE CHICKEN AND EGG. AlphaVault's coldkey is blake2_256("evm:" ‖ its own
-/// address), and the EVM cannot compute blake2_256 — only blake2f, the
-/// compression function (EIP-152). So the coldkey must be supplied at
-/// construction, which means the vault's address must be known BEFORE the vault
-/// exists. Hence two phases:
+/// address), and CHAIN 964 DOES NOT PROVIDE blake2f: address 0x09, the BLAKE2b
+/// compression function on a standard EVM, answers the EIP-152 test vector with
+/// an elliptic-curve error here (sha256 at 0x02 works fine). Note the hash
+/// itself is not the obstacle — one staticcall to a working blake2f would do it,
+/// see test/Blake2Coldkey.t.sol — the chain's precompile set is. So the coldkey
+/// must be supplied at construction, which means the vault's address must be
+/// known BEFORE the vault exists. Hence two phases:
 ///
 ///   1. PHASE=predict — prints the address this deployer's next nonce will
 ///      produce. Feed it to `node tools/coldkey.mjs <address>`.

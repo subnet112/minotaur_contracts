@@ -108,11 +108,29 @@ contract AlphaVault is ReentrancyGuard {
     uint256 private constant VIRTUAL_SHARES = 1e9;
     uint256 private constant VIRTUAL_ALPHA = 1;
 
-    /// blake2_256("evm:" ‖ address(this)) — NOT computable in the EVM (only the
-    /// blake2f compression function, EIP-152), so it is supplied at construction
-    /// and proved at runtime: a successful addStake that does not raise THIS
-    /// coldkey's stake reverts, so the first wrapped purchase fails closed
-    /// rather than mispricing every share after it.
+    /// blake2_256("evm:" ‖ address(this)) — the HashedAddressMapping deciding
+    /// which substrate account this contract controls. Needed for READS, not
+    /// writes: addStake takes no coldkey and credits the caller's mapped account
+    /// automatically, but getStake requires one, and getStake is both how a
+    /// deposit's minted alpha is measured and how the position is priced.
+    ///
+    /// CHAIN 964 DOES NOT PROVIDE blake2f. Address 0x09, which is the
+    /// BLAKE2b compression function (EIP-152) on a standard EVM, is occupied by
+    /// something else here — it answers the EIP-152 test vector with an
+    /// elliptic-curve error, "Invalid point y coordinate", while sha256 at 0x02
+    /// works normally. Probed on a Finney fork at block 8901111.
+    ///
+    /// This matters because the obvious reading is wrong: blake2f WOULD be
+    /// sufficient. "evm:" + a 20-byte address is 24 bytes, a single 128-byte
+    /// block, so the whole hash is one staticcall — proven in
+    /// test/Blake2Coldkey.t.sol, which derives four known coldkeys correctly in
+    /// 5,594 gas on a standard EVM. It is the chain's precompile set that blocks
+    /// it, not a limit of the EVM. If Bittensor ever enables 0x09, this argument
+    /// and the two-phase deploy around it can be deleted.
+    ///
+    /// So it is supplied at construction and proved at runtime: a successful
+    /// addStake that does not raise THIS coldkey's stake reverts, so the first
+    /// wrapped purchase fails closed rather than mispricing every share after it.
     bytes32 public immutable coldkey;
 
     struct Market {

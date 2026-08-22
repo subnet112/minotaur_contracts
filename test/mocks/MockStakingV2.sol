@@ -7,7 +7,8 @@ pragma solidity ^0.8.24;
 ///
 ///   * CUSTODY: `addStake` credits the mapped coldkey of `msg.sender`, never a
 ///     caller-supplied one. Tests wire the mapping with `setColdkeyFor` because
-///     blake2_256 is not computable in the EVM — the chain derives it, we inject it.
+///     blake2_256 is unavailable on chain 964 (no blake2f precompile at 0x09) —
+///     the chain derives it, we inject it. See test/Blake2Coldkey.t.sol.
 ///   * UNITS: `amountRao` is 9-decimal; native value is 18-decimal. The mock
 ///     debits `amountRao * 1e9` wei, exactly as the fork was measured to do.
 ///

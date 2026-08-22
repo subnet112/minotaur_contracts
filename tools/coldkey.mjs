@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // Derive the substrate coldkey an H160 controls on Bittensor: blake2_256("evm:" ‖ address).
 //
-// This CANNOT be computed on chain — the EVM exposes only blake2f (EIP-152), the
-// compression function, not the full hash. So AlphaVault takes its coldkey as a
+// This cannot be computed on chain 964, because that chain does not provide the
+// blake2f precompile: address 0x09 answers the EIP-152 test vector with an
+// elliptic-curve error, while sha256 at 0x02 works normally (probed on a Finney
+// fork at block 8901111). The hash is NOT the obstacle — "evm:" + 20 bytes is a
+// single 128-byte block, so a working blake2f would derive it in one staticcall
+// (test/Blake2Coldkey.t.sol does exactly that in 5,594 gas on a standard EVM).
+// So AlphaVault takes its coldkey as a
 // constructor argument, and a wrong one is caught by NO Solidity assertion: the
 // vault deploys cleanly, then every purchase reverts ColdkeyMismatch at FIRST USE,
 // because a successful addStake did not raise the stake of the coldkey it was told
