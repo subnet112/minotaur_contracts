@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {AppIntentBase} from "./AppIntentBase.sol";
+import {AppIntentBaseV2} from "./AppIntentBaseV2.sol";
 import {AlphaVault} from "./AlphaVault.sol";
 import {IMetagraph} from "./interfaces/IMetagraph.sol";
 
@@ -53,6 +53,14 @@ import {IMetagraph} from "./interfaces/IMetagraph.sol";
 /// what makes this scorable in a fork simulation at a single block instead of
 /// requiring an epoch of waiting.
 ///
+/// BASE: AppIntentBaseV2, matching the live DEX Aggregator V2 (the only App
+/// actually deployed on this platform). Note V2's four gas optimisations are
+/// almost all in the proxy/execution path, which this App deliberately does not
+/// use — it never calls _executePlan, so the EIP-1167 executor clones and the
+/// transient balance snapshots buy it nothing. Only the transient reentrancy
+/// guard and the sentinel-only executedOrders write apply. The reason to be on
+/// V2 here is CONSISTENCY with the platform's real base, not gas.
+///
 /// KNOWN LIMIT, STATED PLAINLY: the formula omits the delegate TAKE, because no
 /// precompile exposes it. Actual payout is `dividends × (1 − take)`, so a
 /// validator that charges 100% would score identically to one that charges
@@ -61,7 +69,7 @@ import {IMetagraph} from "./interfaces/IMetagraph.sol";
 /// the performance fee, which is charged on realised share-price growth — so a
 /// plan that routes to a take-everything validator earns the fee recipient
 /// nothing either. Do not raise `scoreThreshold` expecting it to police take.
-contract AlphaYieldApp is AppIntentBase {
+contract AlphaYieldApp is AppIntentBaseV2 {
     IMetagraph public constant METAGRAPH = IMetagraph(0x0000000000000000000000000000000000000802);
 
     /// Scores are a fraction of the achievable optimum, expressed in BPS.
@@ -98,7 +106,7 @@ contract AlphaYieldApp is AppIntentBase {
         address _appPaymaster,
         address _appRegistry
     )
-        AppIntentBase(
+        AppIntentBaseV2(
             _relayer,
             _validatorRegistry,
             _scoreThreshold,

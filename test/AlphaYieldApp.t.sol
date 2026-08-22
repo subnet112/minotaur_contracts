@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {AlphaVault} from "../src/AlphaVault.sol";
 import {AlphaYieldApp} from "../src/AlphaYieldApp.sol";
-import {AppIntentBase} from "../src/AppIntentBase.sol";
+import {AppIntentBaseV2} from "../src/AppIntentBaseV2.sol";
 import {IAppIntentBase} from "../src/interfaces/IAppIntentBase.sol";
 import {MockStakingV2} from "./mocks/MockStakingV2.sol";
 import {MockMetagraph} from "./mocks/MockMetagraph.sol";
@@ -68,7 +68,7 @@ contract AlphaYieldAppTest is Test {
 
         app = new AlphaYieldApp(
             address(vault), relayer, registry, 5000,
-            address(0xA7A0), address(0), 0, 0, AppIntentBase.FeeMode.APP, address(0), address(0)
+            address(0xA7A0), address(0), 0, 0, AppIntentBaseV2.FeeMode.APP, address(0), address(0)
         );
 
         vm.startPrank(gov);
@@ -271,7 +271,7 @@ contract AlphaYieldSingleCandidateTest is Test {
 
         app = new AlphaYieldApp(
             address(vault), relayer, address(0x9E61), 5000,
-            address(0xA7A0), address(0), 0, 0, AppIntentBase.FeeMode.APP, address(0), address(0)
+            address(0xA7A0), address(0), 0, 0, AppIntentBaseV2.FeeMode.APP, address(0), address(0)
         );
 
         AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](1);

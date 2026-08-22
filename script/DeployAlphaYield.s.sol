@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Script.sol";
 import {AlphaVault} from "../src/AlphaVault.sol";
 import {AlphaYieldApp} from "../src/AlphaYieldApp.sol";
-import {AppIntentBase} from "../src/AppIntentBase.sol";
+import {AppIntentBaseV2} from "../src/AppIntentBaseV2.sol";
 import {IMetagraph} from "../src/interfaces/IMetagraph.sol";
 
 /// Deploy AlphaVault + AlphaYieldApp on Bittensor EVM (964).
@@ -29,6 +29,8 @@ import {IMetagraph} from "../src/interfaces/IMetagraph.sol";
 ///   PHASE              - "predict" or "deploy"
 ///   DEPLOYER_PRIVATE_KEY
 ///   VAULT_COLDKEY      - bytes32, from tools/coldkey.mjs (deploy phase only)
+///   EXPECTED_VAULT     - the address PHASE 1 printed, i.e. the address the
+///                        coldkey was derived from (deploy phase only)
 ///   GOVERNOR           - allowlist + fee admin
 ///   RELAYER            - the platform relayer
 ///   FEE_RECIPIENT, PERFORMANCE_FEE_BPS
@@ -69,9 +71,13 @@ contract DeployAlphaYield is Script {
         console.log("vault will deploy to:", predicted);
         console.log("");
         console.log("Next: node tools/coldkey.mjs", vm.toString(predicted));
-        console.log("Then re-run with PHASE=deploy and VAULT_COLDKEY set.");
-        console.log("Do NOT send any other transaction from this deployer in between:");
-        console.log("the nonce would move and the coldkey would bind to the wrong address.");
+        console.log("Then re-run with PHASE=deploy, VAULT_COLDKEY set, and");
+        console.log("EXPECTED_VAULT set to the address above.");
+        console.log("");
+        console.log("Send NO other transaction from this deployer in between. Every tx");
+        console.log("moves the nonce, which moves the vault's address, which invalidates");
+        console.log("the coldkey. Phase 2 refuses to deploy if that happened, so the");
+        console.log("failure is loud, but a shared, actively-used key will hit it.");
     }
 
     function _deploy(uint256 key, address deployer) private {
@@ -95,13 +101,24 @@ contract DeployAlphaYield is Script {
             );
         }
 
+        // The check that actually matters, and it has to be against PHASE 1's
+        // address, not against a freshly-read nonce. Comparing the deployed
+        // address to computeCreateAddress(deployer, currentNonce) is a tautology
+        // — both use the same nonce, so it can never fail and proves nothing.
+        // The coldkey was derived from ONE specific address; assert we are still
+        // going to land on it, BEFORE spending any gas.
+        address expected = vm.envAddress("EXPECTED_VAULT");
         address predicted = vm.computeCreateAddress(deployer, vm.getNonce(deployer));
+        require(
+            predicted == expected,
+            "nonce moved since PHASE 1: the vault would land elsewhere and the coldkey would be wrong. Re-run PHASE=predict."
+        );
 
         vm.startBroadcast(key);
 
         // Deployer holds governance during setup, then hands it over.
         AlphaVault vault = new AlphaVault(coldkey, deployer);
-        require(address(vault) == predicted, "vault address moved; coldkey would be wrong");
+        require(address(vault) == expected, "vault did not land on the expected address");
 
         AlphaYieldApp app = new AlphaYieldApp(
             address(vault),
@@ -112,7 +129,7 @@ contract DeployAlphaYield is Script {
             vm.envOr("FEE_COLLECTOR", address(0)),
             0,
             0,
-            AppIntentBase.FeeMode.APP,
+            AppIntentBaseV2.FeeMode.APP,
             address(0),
             APP_REGISTRY_964
         );

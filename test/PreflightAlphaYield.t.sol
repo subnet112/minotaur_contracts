@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {PreflightAlphaYield} from "../script/PreflightAlphaYield.s.sol";
 import {AlphaVault} from "../src/AlphaVault.sol";
 import {AlphaYieldApp} from "../src/AlphaYieldApp.sol";
-import {AppIntentBase} from "../src/AppIntentBase.sol";
+import {AppIntentBaseV2} from "../src/AppIntentBaseV2.sol";
 import {MockStakingV2} from "./mocks/MockStakingV2.sol";
 import {MockMetagraph} from "./mocks/MockMetagraph.sol";
 
@@ -55,7 +55,7 @@ contract PreflightAlphaYieldTest is Test {
 
         app = new AlphaYieldApp(
             address(vault), relayer, address(valReg), 5000, wtao,
-            address(0), 0, 0, AppIntentBase.FeeMode.APP, address(0), address(appReg)
+            address(0), 0, 0, AppIntentBaseV2.FeeMode.APP, address(0), address(appReg)
         );
 
         AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](2);
