@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console} from "forge-std/Test.sol";
 import {AlphaVault} from "../src/AlphaVault.sol";
 import {AlphaYieldApp} from "../src/AlphaYieldApp.sol";
 import {AppIntentBase} from "../src/AppIntentBase.sol";
@@ -240,5 +240,73 @@ contract AlphaYieldAppTest is Test {
         assertEq(uids[1], 1);
         assertGt(rates[1], rates[0], "survey does not reveal which validator is better");
         assertEq(readyAt, vault.nextRebalanceAt(112));
+    }
+}
+
+/// What the deploy script actually produces on day one: a market opened with a
+/// single candidate, because the allowlist can only be widened through a 2-day
+/// timelock. Scoring has to mean something in that state.
+contract AlphaYieldSingleCandidateTest is Test {
+    MockStakingV2 staking;
+    MockMetagraph meta;
+    AlphaVault vault;
+    AlphaYieldApp app;
+
+    bytes32 constant HK_A = bytes32(uint256(0xAA));
+    bytes32 constant VAULT_CK = bytes32(uint256(0xC01D));
+    address gov = address(0x600D);
+    address relayer = address(0xC0FFEE);
+    bytes4 sel;
+
+    function setUp() public {
+        vm.etch(0x0000000000000000000000000000000000000805, address(new MockStakingV2()).code);
+        staking = MockStakingV2(payable(0x0000000000000000000000000000000000000805));
+        vm.etch(0x0000000000000000000000000000000000000802, address(new MockMetagraph()).code);
+        meta = MockMetagraph(0x0000000000000000000000000000000000000802);
+        meta.setNeuron(112, 0, HK_A, 672_893_522_735, 15000, true);
+
+        vault = new AlphaVault(VAULT_CK, gov);
+        staking.setColdkeyFor(address(vault), VAULT_CK);
+        staking.setAlphaPerRao(445);
+
+        app = new AlphaYieldApp(
+            address(vault), relayer, address(0x9E61), 5000,
+            address(0xA7A0), address(0), 0, 0, AppIntentBase.FeeMode.APP, address(0), address(0)
+        );
+
+        AlphaVault.Candidate[] memory cs = new AlphaVault.Candidate[](1);
+        cs[0] = AlphaVault.Candidate({hotkey: HK_A, uid: 0});
+        vm.startPrank(gov);
+        vault.openMarket(112, cs, "w", "w");
+        vault.setOptimizer(address(app));
+        vm.stopPrank();
+
+        sel = app.OPTIMIZE_YIELD();
+        vm.deal(address(staking), 1_000_000 ether);
+        vm.deal(address(this), 10 ether);
+        vault.purchaseWrapped{value: 1e18}(112, address(this), 0);
+    }
+
+    /// With one candidate there is no choice to make, so there is nothing to
+    /// grade. Paying full marks would turn the intent into a free-points faucet:
+    /// every round, every solver names the only option and scores 1.0 for a no-op.
+    function test_a_single_candidate_market_is_not_scoreable() public {
+        IAppIntentBase.IntentOrder memory o;
+        o.orderId = keccak256("o");
+        o.app = address(app);
+        o.intentSelector = sel;
+        o.intentParams = abi.encode(uint256(112));
+        o.chainId = block.chainid;
+        o.deadline = block.timestamp + 1 hours;
+
+        IAppIntentBase.ExecutionPlan memory p;
+        p.calls = new IAppIntentBase.Call[](0);
+        p.metadata = abi.encode(HK_A, uint16(0));
+
+        vm.prank(relayer);
+        vm.expectRevert(
+            abi.encodeWithSelector(AlphaYieldApp.NothingToOptimize.selector, uint256(112), uint256(1))
+        );
+        app.scoreIntent(o, p);
     }
 }

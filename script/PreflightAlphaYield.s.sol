@@ -116,7 +116,9 @@ contract PreflightAlphaYield is Script {
         _ok("market is open", hotkey != bytes32(0));
 
         uint256 n = vault.candidateCount(netuid);
-        _ok("market has candidates", n > 0);
+        // Not "> 0": one candidate is unscoreable and the App reverts
+        // NothingToOptimize rather than paying full marks for a forced choice.
+        _ok("market has at least TWO candidates (one is unscoreable)", n >= 2);
         _ok("candidate set is within MAX_CANDIDATES", n <= vault.MAX_CANDIDATES());
 
         bool incumbentAllowed;

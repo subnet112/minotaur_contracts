@@ -83,6 +83,7 @@ contract AlphaYieldApp is AppIntentBase {
 
     error NotAllowlisted(bytes32 hotkey);
     error NoScorableYield(uint256 netuid);
+    error NothingToOptimize(uint256 netuid, uint256 candidates);
 
     constructor(
         address _vault,
@@ -213,6 +214,16 @@ contract AlphaYieldApp is AppIntentBase {
         (bytes32 chosen, uint16 uid) = abi.decode(plan.metadata, (bytes32, uint16));
 
         if (!vault.isCandidate(netuid, chosen)) revert NotAllowlisted(chosen);
+
+        // With fewer than two candidates there is no choice to make and so
+        // nothing to grade. Min-max would hand out FULL MARKS — best equals
+        // worst, every solver names the only option, and the intent becomes a
+        // free-points faucet paying 1.0 for a no-op every round. A market opened
+        // with one validator (which is what a fresh deploy produces, since the
+        // allowlist can only be widened through a 2-day timelock) is simply not
+        // scoreable until a second candidate lands.
+        uint256 candidates = vault.candidateCount(netuid);
+        if (candidates < 2) revert NothingToOptimize(netuid, candidates);
 
         (, , uint256 bestRate, uint256 worstRate) = candidateRange(netuid);
         // No validator on the allowlist is earning anything: there is no better

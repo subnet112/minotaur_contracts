@@ -32,7 +32,13 @@ import {IMetagraph} from "../src/interfaces/IMetagraph.sol";
 ///   GOVERNOR           - allowlist + fee admin
 ///   RELAYER            - the platform relayer
 ///   FEE_RECIPIENT, PERFORMANCE_FEE_BPS
-///   NETUID, MARKET_HOTKEY, MARKET_UID, TOKEN_NAME, TOKEN_SYMBOL
+///   NETUID, TOKEN_NAME, TOKEN_SYMBOL
+///   MARKET_HOTKEYS - comma-separated bytes32, AT LEAST TWO. Index 0 becomes the
+///                    live delegation. One candidate is not a deployable state:
+///                    there is nothing to choose between, so the App declines to
+///                    score it (NothingToOptimize) and the intent would sit idle
+///                    until a second candidate cleared the 2-day timelock.
+///   MARKET_UIDS    - comma-separated uints, same order and length
 ///   REBALANCE_COOLDOWN - seconds; the perpetual order must be signed with at
 ///                        least this, see PreflightAlphaYield
 contract DeployAlphaYield is Script {
@@ -75,15 +81,19 @@ contract DeployAlphaYield is Script {
         address governor = vm.envAddress("GOVERNOR");
         address relayer = vm.envAddress("RELAYER");
         uint256 netuid = vm.envUint("NETUID");
-        bytes32 marketHotkey = vm.envBytes32("MARKET_HOTKEY");
-        uint16 marketUid = uint16(vm.envUint("MARKET_UID"));
+        bytes32[] memory hotkeys = vm.envBytes32("MARKET_HOTKEYS", ",");
+        uint256[] memory uids = vm.envUint("MARKET_UIDS", ",");
+        require(hotkeys.length == uids.length, "MARKET_HOTKEYS/MARKET_UIDS length mismatch");
+        require(hotkeys.length >= 2, "need at least TWO candidates; one is unscoreable");
 
-        // Prove the pairing BEFORE spending gas: openMarket would revert on it
-        // anyway, but failing here costs nothing and says why.
-        require(
-            METAGRAPH.getHotkey(uint16(netuid), marketUid) == marketHotkey,
-            "MARKET_UID does not map to MARKET_HOTKEY on the metagraph"
-        );
+        // Prove every pairing BEFORE spending gas: openMarket would revert on it
+        // anyway, but failing here costs nothing and says which one is wrong.
+        for (uint256 i = 0; i < hotkeys.length; ++i) {
+            require(
+                METAGRAPH.getHotkey(uint16(netuid), uint16(uids[i])) == hotkeys[i],
+                "a MARKET_UID does not map to its MARKET_HOTKEY on the metagraph"
+            );
+        }
 
         address predicted = vm.computeCreateAddress(deployer, vm.getNonce(deployer));
 
@@ -107,8 +117,10 @@ contract DeployAlphaYield is Script {
             APP_REGISTRY_964
         );
 
-        AlphaVault.Candidate[] memory initial = new AlphaVault.Candidate[](1);
-        initial[0] = AlphaVault.Candidate({hotkey: marketHotkey, uid: marketUid});
+        AlphaVault.Candidate[] memory initial = new AlphaVault.Candidate[](hotkeys.length);
+        for (uint256 i = 0; i < hotkeys.length; ++i) {
+            initial[i] = AlphaVault.Candidate({hotkey: hotkeys[i], uid: uint16(uids[i])});
+        }
         vault.openMarket(
             netuid, initial,
             vm.envOr("TOKEN_NAME", string("Wrapped Alpha")),
