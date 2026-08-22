@@ -70,14 +70,10 @@ contract PreflightAlphaYieldTest is Test {
         appReg.register(address(app), keccak256("alpha-yield"));
 
         pf = new PreflightAlphaYield();
-        vm.setEnv("VAULT", vm.toString(address(vault)));
-        vm.setEnv("APP", vm.toString(address(app)));
-        vm.setEnv("NETUID", "112");
-        vm.setEnv("ORDER_COOLDOWN", "21600");
     }
 
     function test_a_correctly_wired_deployment_passes() public {
-        pf.run();
+        pf.check(vault, app, 112, 21600);
     }
 
     /// THE ONE THIS EXISTS FOR. scoreIntent never calls _requireRegistered, so
@@ -86,14 +82,14 @@ contract PreflightAlphaYieldTest is Test {
     function test_it_catches_an_unregistered_app() public {
         appReg.register(address(app), bytes32(0));
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 112, 21600);
     }
 
     function test_it_catches_an_optimizer_that_is_not_the_app() public {
         vm.prank(gov);
         vault.setOptimizer(address(0xDEAD));
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 112, 21600);
     }
 
     /// uids are SLOTS and get reused when a neuron deregisters. A stale pairing
@@ -101,26 +97,24 @@ contract PreflightAlphaYieldTest is Test {
     function test_it_catches_a_candidate_uid_that_no_longer_maps() public {
         meta.setNeuron(112, 1, bytes32(uint256(0xDEAD)), 1, 1, true);
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 112, 21600);
     }
 
     function test_it_catches_a_stale_validator_registry() public {
         valReg.setQuorum(0);
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 112, 21600);
     }
 
     /// An order cooldown shorter than the vault's just burns rounds: the fill
     /// reverts RebalanceTooSoon every time until the vault's clock catches up.
     function test_it_catches_an_order_cooldown_shorter_than_the_vaults() public {
-        vm.setEnv("ORDER_COOLDOWN", "3600"); // vault default is 6h
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 112, 3600); // vault default is 6h
     }
 
     function test_it_catches_a_market_that_was_never_opened() public {
-        vm.setEnv("NETUID", "64");
         vm.expectRevert("preflight failed");
-        pf.run();
+        pf.check(vault, app, 64, 21600);
     }
 }

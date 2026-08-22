@@ -38,11 +38,30 @@ contract PreflightAlphaYield is Script {
     uint256 private failures;
 
     function run() external {
-        AlphaVault vault = AlphaVault(payable(vm.envAddress("VAULT")));
-        AlphaYieldApp app = AlphaYieldApp(payable(vm.envAddress("APP")));
-        uint256 netuid = vm.envOr("NETUID", uint256(0));
-        uint256 orderCooldown = vm.envOr("ORDER_COOLDOWN", uint256(0));
+        check(
+            AlphaVault(payable(vm.envAddress("VAULT"))),
+            AlphaYieldApp(payable(vm.envAddress("APP"))),
+            vm.envOr("NETUID", uint256(0)),
+            vm.envOr("ORDER_COOLDOWN", uint256(0))
+        );
+    }
 
+    /// The gate itself, taking parameters rather than reading the environment.
+    ///
+    /// `vm.setEnv` writes the HOST environment, which is shared process-wide and
+    /// survives across tests AND across concurrently-running test contracts.
+    /// When both this script's tests and the deploy script's tests drove
+    /// themselves through env vars they collided on NETUID and the suite went
+    /// flaky — passing individually, failing about one run in three together.
+    /// A flaky test is worse than none: it reads as coverage. So the logic takes
+    /// arguments and only `run()` touches the environment.
+    function check(
+        AlphaVault vault,
+        AlphaYieldApp app,
+        uint256 netuid,
+        uint256 orderCooldown
+    ) public {
+        failures = 0;
         console.log("=== Preflight: AlphaYield on chain", block.chainid, "===");
 
         _wiring(vault, app);
